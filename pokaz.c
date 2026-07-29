@@ -101,6 +101,20 @@ static void dprintf(const char *fmt, ...)
 }
 
 //
+// TIMING
+//
+
+static inline double time_in_ms(void)
+{
+    static LARGE_INTEGER freq = {0};
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+
+    LARGE_INTEGER cnt;
+    QueryPerformanceCounter(&cnt);
+    return (double)cnt.QuadPart * 1000.0 / (double)freq.QuadPart;
+}
+
+//
 // MEMORY
 //
 
@@ -168,12 +182,19 @@ static inline bool opengl_init(HWND hwnd)
 
 static void opengl_cleanup(HWND hwnd)
 {
+    if (g_render.tex != 0)
+    {
+        glDeleteTextures(1, &g_render.tex);
+        g_render.tex = 0;
+    }
+
     if (g_gl.hglrc)
     {
         wglMakeCurrent(NULL, NULL);
         wglDeleteContext(g_gl.hglrc);
         g_gl.hglrc = NULL;
     }
+
     if (g_gl.hdc)
     {
         ReleaseDC(hwnd, g_gl.hdc);
@@ -196,7 +217,7 @@ static GLuint opengl_texture_upload(BYTE *buf, UINT w, UINT h)
 
     glBindTexture(GL_TEXTURE_2D, 0);
 
-    // dprintf("texture_upload : alloc + upload : %.3fms\n", ZONE_ELAPSED_MS());
+    // dprintf("texture_upload : alloc + upload : %.3fms\n", time);
 
     return tex;
 }
@@ -237,6 +258,8 @@ static bool wic_decode(const wchar_t *path, BYTE *out_buf, UINT *out_w, UINT *ou
 
     bool result = false;
 
+    double time_start = time_in_ms();
+
     HRESULT hr;
     hr = IWICImagingFactory_CreateDecoderFromFilename(g_wic, path, NULL, GENERIC_READ,
                                                       WICDecodeMetadataCacheOnDemand, &decoder);
@@ -269,8 +292,8 @@ done:
     if (frame) IWICBitmapFrameDecode_Release(frame);
     if (decoder) IWICBitmapDecoder_Release(decoder);
 
-    // TODO : add timing information
-    dprintf("decode_wic: %ux%u %s\n", *out_w, *out_h, result ? "OK" : "ERROR");
+    double time_elapsed = time_in_ms() - time_start;
+    dprintf("decode_wic: %ux%u %.3fms, %s\n", *out_w, *out_h, time_elapsed, result ? "OK" : "ERROR");
 
     return result;
 }
@@ -290,6 +313,8 @@ static bool turbojpeg_decode(const wchar_t *path, BYTE *buf, UINT *out_w, UINT *
     BYTE  *file_buf = NULL;
     bool   result   = false;
     HANDLE f        = INVALID_HANDLE_VALUE;
+
+    double time_start = time_in_ms();
 
     f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                     OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
@@ -336,7 +361,8 @@ done:
         dprintf("decode_jpeg_turbo: %s\n", tjGetErrorStr2(handle));
     }
 
-    dprintf("decode_jpeg_turbo: %ux%u\n", *out_w, *out_h);
+    double time_elapsed = time_in_ms() - time_start;
+    dprintf("turbojpeg_decode: %ux%u %.3fms, %s\n", *out_w, *out_h, time_elapsed, result ? "OK" : "ERROR");
 
     return result;
 }
