@@ -65,7 +65,9 @@ struct render_state
 {
     GLuint tex;
     int    w, h;
-    int    rotation;
+
+    int   rotation;
+    float zoom;
 };
 
 static int g_win_w = WINDOW_START_W;
@@ -76,6 +78,7 @@ static struct render_state g_render = {0};
 
 static IWICImagingFactory *g_wic = NULL;
 
+//
 // DEBUG
 //
 
@@ -400,10 +403,20 @@ static bool decode_image(const wchar_t *path, BYTE *buf, UINT *w, UINT *h)
 // RENDER
 //
 
+static inline void image_reset_view(void)
+{
+    g_render.zoom     = 0.0f;
+    g_render.pan_x    = 0.0f;
+    g_render.pan_y    = 0.0f;
+    g_render.rotation = 0;
+}
+
 static void image_show_current(void)
 {
     if (g_files.count > 0)
     {
+        image_reset_view();
+
         UINT     w = 0, h = 0;
         BYTE    *image = vmalloc(IMAGE_PREALLOC_SIZE);
         wchar_t *path  = g_files.paths[g_files.current];
@@ -411,6 +424,8 @@ static void image_show_current(void)
         dprintf("uploading image %ls\n", path);
         bool res = decode_image(path, image, &w, &h);
         if (!res) dprintf("image decode failed\n");
+
+        if (g_render.tex != 0) glDeleteTextures(1, &g_render.tex);
 
         g_render.tex = opengl_texture_upload(image, w, h);
         g_render.w   = w;
@@ -434,14 +449,13 @@ static void image_render(void)
     float sx    = (float)g_win_w / (float)fit_w;
     float sy    = (float)g_win_h / (float)fit_h;
     float fit   = (sx < sy) ? sx : sy;
-    float scale = fit * powf(1.15f, 1.0f);
+    float scale = fit * powf(1.15f, g_render.zoom);
 
-    // 3. Build quad dimensions in UNROTATED image space
     float dw = g_render.w * scale;
     float dh = g_render.h * scale;
 
-    float cx = g_win_w * 0.5f;
-    float cy = g_win_h * 0.5f;
+    float cx = g_win_w * 0.5f + g_render.pan_x;
+    float cy = g_win_h * 0.5f + g_render.pan_y;
 
     float x0 = cx - dw * 0.5f, y0 = cy - dh * 0.5f;
     float x1 = cx + dw * 0.5f, y1 = cy + dh * 0.5f;
@@ -602,10 +616,13 @@ static void scan_from_path(const wchar_t *path)
         }
     }
 
-    dprintf("Loaded images : \n");
-    for (uint16_t i = 0; i < g_files.count; i++)
+    if (0)
     {
-        dprintf("    %ls %s\n", g_files.paths[i], g_files.current == i ? "<--" : "");
+        dprintf("Loaded images : \n");
+        for (uint16_t i = 0; i < g_files.count; i++)
+        {
+            dprintf("    %ls %s\n", g_files.paths[i], g_files.current == i ? "<--" : "");
+        }
     }
 }
 
@@ -651,9 +668,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     if (g_files.count > 0)
                     {
                         g_files.current = (g_files.current + 1) % g_files.count;
+                        image_show_current();
                         InvalidateRect(hwnd, NULL, FALSE);
                     }
-                    return 0;
+                    break;
                 }
                 case VK_LEFT:
                 case VK_PRIOR:
@@ -662,13 +680,54 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     if (g_files.count > 0)
                     {
                         g_files.current = (g_files.current + g_files.count - 1) % g_files.count;
+                        image_show_current();
                         InvalidateRect(hwnd, NULL, FALSE);
                     }
-                    return 0;
+                    break;
+                }
+                case VK_HOME:
+                {
+                    if (g_files.count > 0)
+                    {
+                        g_files.current = 0;
+                        image_show_current();
+                        InvalidateRect(hwnd, NULL, FALSE);
+                    }
+                    break;
+                }
+                case VK_END:
+                {
+                    if (g_files.count > 0)
+                    {
+                        g_files.current = g_files.count - 1;
+                        image_show_current();
+                        InvalidateRect(hwnd, NULL, FALSE);
+                    }
+                    break;
                 }
                 case 'R':
                 {
                     g_render.rotation = (g_render.rotation + 90) % 360;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                }
+                case 'Z':
+                {
+                    // TODO : zoom limits
+                    g_render.zoom += 1.0f;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                }
+                case 'X':
+                {
+                    // TODO : zoom limits
+                    g_render.zoom -= 1.0f;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                }
+                case '0':
+                {
+                    image_reset_view();
                     InvalidateRect(hwnd, NULL, FALSE);
                     break;
                 }
@@ -706,7 +765,6 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             BeginPaint(hwnd, &ps);
 
             window_update_title(hwnd);
-            image_show_current();
             image_render();
             SwapBuffers(g_gl.hdc);
 
@@ -811,6 +869,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     dprintf("setup finished\n");
 
+    image_show_current();
     ShowWindow(hwnd, nCmdShow);
     // UpdateWindow(hwnd);
 
