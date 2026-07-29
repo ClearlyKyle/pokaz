@@ -5,6 +5,7 @@
 #define UNICODE
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <wchar.h>
 #include <shellapi.h>
 
 #include <GL/gl.h>
@@ -26,14 +27,31 @@
 #define WINDOW_START_H (1024)
 #define WINDOW_START_W (768)
 
+#define FILES_MAX_COUNT (65535)
+
+static const wchar_t *SUPPORTED_EXTENSIONS[] = {
+    L".jpg", L".jpeg", L".png", L".bmp", L".gif",
+    L".tiff", L".tif", L".ico", L".webp", L".wdp",
+    L".hdp", L".jxr"};
+
 //
 // STATE
 //
 
+struct file_list
+{
+    wchar_t *paths[FILES_MAX_COUNT];
+    wchar_t *data;
+    size_t   data_used_chars;
+    uint16_t count;
+    uint16_t current;
+};
+
 static int g_win_w = WINDOW_START_W;
 static int g_win_h = WINDOW_START_H;
 
-//
+struct file_list g_files = {0};
+
 // DEBUG
 //
 
@@ -56,6 +74,20 @@ static void dprintf(const char *fmt, ...)
 #else
     UNUSED(fmt);
 #endif
+}
+
+//
+// MEMORY
+//
+
+static inline void *vmalloc(size_t size)
+{
+    return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+}
+
+static inline void vfree(void *ptr)
+{
+    if (ptr) VirtualFree(ptr, 0, MEM_RELEASE);
 }
 
 //
@@ -128,6 +160,135 @@ static void image_render(void)
 }
 
 //
+// DIRECTORY
+//
+
+static int is_ext_supported(const wchar_t *name)
+{
+    const wchar_t *dot = wcsrchr(name, L'.');
+    if (!dot) return 0;
+
+    for (size_t i = 0; i < ARRAY_LENGTH(SUPPORTED_EXTENSIONS); ++i)
+    {
+        if (_wcsicmp(dot, SUPPORTED_EXTENSIONS[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static void scan_directory(const wchar_t *dir, size_t len)
+{
+    dprintf("scan_directory : %ls\n", dir);
+
+    if (!g_files.data)
+        g_files.data = vmalloc(FILES_MAX_COUNT * MAX_PATH * sizeof(wchar_t));
+
+    g_files.count   = 0;
+    g_files.current = 0;
+
+    wchar_t pattern[MAX_PATH] = {0};
+    swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
+
+    WIN32_FIND_DATAW fd;
+    HANDLE           hf = FindFirstFileExW(pattern,
+                                           FindExInfoBasic,
+                                           &fd,
+                                           FindExSearchNameMatch,
+                                           NULL,
+                                           0);
+
+    // pattern[pattern_end - 1] = 0; // now we have the base path
+    // pattern would look like : "images\4\*",
+    //  pattern_len = 10                  ^
+    //  base_len    = 9                  ^    (up to the last \)
+    // size_t pattern_len = wcslen(pattern);
+    // size_t base_len    = pattern_len - 1;
+    size_t base_len = len + 1;
+
+    if (hf == INVALID_HANDLE_VALUE) return;
+
+    do
+    {
+        if (g_files.count >= FILES_MAX_COUNT) break;
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+
+        if (!is_ext_supported(fd.cFileName))
+            continue;
+
+        size_t file_len  = wcslen(fd.cFileName);
+        size_t total_len = base_len + file_len + 1; // +1 for null terminator
+
+        // TODO : pack the names tigher
+        wchar_t *full                = g_files.data + (g_files.count * MAX_PATH);
+        g_files.paths[g_files.count] = full;
+
+        // TODO : could we save the base somewhere, then just append the file when loading?
+        wmemcpy(full, pattern, base_len);
+        wmemcpy(full + base_len, fd.cFileName, file_len + 1); // include \0
+
+        g_files.data_used_chars += total_len;
+        g_files.count++;
+
+    } while (FindNextFileW(hf, &fd));
+
+    FindClose(hf);
+}
+
+static void scan_from_path(const wchar_t *path)
+{
+    dprintf("scan_from_path : %ls\n", path);
+
+    wchar_t dir[MAX_PATH] = {0};
+    wcscpy_s(dir, MAX_PATH, path); // NOTE : do we even need to copy?
+
+    // strip trailing quotes and backslashes
+    size_t len = wcslen(dir);
+    while (len > 0 &&
+           ((dir[len - 1] == L'"') || (dir[len - 1] == L'\\')))
+    {
+        dir[--len] = L'\0';
+    }
+
+    DWORD attr = GetFileAttributesW(dir);
+    if (attr == INVALID_FILE_ATTRIBUTES) return;
+
+    if (attr & FILE_ATTRIBUTE_DIRECTORY)
+    {
+        scan_directory(dir, len);
+    }
+    else
+    {
+        // truncate to parent directory
+        wchar_t *sep = wcsrchr(dir, L'\\');
+        if (sep)
+        {
+            *sep = L'\0';
+            scan_directory(dir, len);
+        }
+    }
+
+    // NOTE : if we are given an image path, we set it as current
+    //  but if given a directory we set current as the first image
+    //  we should skip this if given a directory
+    for (uint16_t i = 0; i < g_files.count; i++)
+    {
+        if (_wcsicmp(g_files.paths[i], path) == 0)
+        {
+            g_files.current = i;
+            break;
+        }
+    }
+
+    dprintf("Loaded images : \n");
+    for (uint16_t i = 0; i < g_files.count; i++)
+    {
+        dprintf("    %ls %s\n", g_files.paths[i], g_files.current == i ? "<--" : "");
+    }
+}
+
+//
 // WIN MAIN/PROC
 //
 
@@ -141,6 +302,19 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
             }
             return 0;
+
+        case WM_DROPFILES:
+        {
+            HDROP   hDrop         = (HDROP)wParam;
+            wchar_t buf[MAX_PATH] = {0};
+            if (DragQueryFileW(hDrop, 0, buf, MAX_PATH))
+            {
+                scan_from_path(buf);
+            }
+
+            DragFinish(hDrop);
+            return 0;
+        }
 
         case WM_ERASEBKGND:
             // prevent Windows from clearing background with GDI white brush
@@ -198,7 +372,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc >= 2)
     {
+        scan_from_path(argv[1]);
         LocalFree(argv);
+    }
+    else
+    {
+        dprintf("no paths found on the command line\n");
     }
 
     LPCWSTR class_name  = L"PokazWC";
@@ -256,6 +435,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
 
     UnregisterClassW(class_name, hInstance);
+
+    if (g_files.data) vfree(g_files.data);
 
     return (int)msg.wParam;
 }
