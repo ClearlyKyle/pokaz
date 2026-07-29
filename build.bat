@@ -7,8 +7,8 @@ if "%MODE%"=="" set MODE=debug
 
 set SOURCES=pokaz.c
 
-set COMMON_CFLAGS=/nologo /W4
-set COMMON_LFLAGS=/link /ENTRY:wWinMainCRTStartup
+set COMMON_CFLAGS=/nologo /W4 
+set COMMON_LFLAGS=/link /ENTRY:wWinMainCRTStartup /LIBPATH:deps
 
 if /i "%MODE%"=="release" (
     set CFLAGS=%COMMON_CFLAGS% /O2 /DNDEBUG
@@ -20,6 +20,7 @@ if /i "%MODE%"=="release" (
 
 cl %CFLAGS% ^
     %SOURCES% ^
+    /I "deps" ^
     /Fo"bin\\" ^
     /Fd"bin\\" ^
     /Fe"bin\\pokaz.exe" ^

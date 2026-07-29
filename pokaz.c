@@ -1,19 +1,28 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <math.h>
 
 #define UNICODE
 #define WIN32_LEAN_AND_MEAN
+#define COBJMACROS
 #include <windows.h>
+#include <wincodec.h>
 #include <wchar.h>
 #include <shellapi.h>
 
 #include <GL/gl.h>
 
+#define LIBJPEG_TURBO_STATIC
+#include <turbojpeg.h>
+#pragma comment(lib, "turbojpeg-static")
+
 #pragma comment(lib, "user32")
 #pragma comment(lib, "shell32")
 #pragma comment(lib, "opengl32")
 #pragma comment(lib, "gdi32")
+#pragma comment(lib, "ole32")
+#pragma comment(lib, "windowscodecs")
 
 //
 // DEFINES
@@ -28,6 +37,10 @@
 #define WINDOW_START_W (768)
 
 #define FILES_MAX_COUNT (65535)
+
+#define IMAGE_MAX_W         (4096)
+#define IMAGE_MAX_H         (4096)
+#define IMAGE_PREALLOC_SIZE (IMAGE_MAX_W * IMAGE_MAX_H * 4)
 
 static const wchar_t *SUPPORTED_EXTENSIONS[] = {
     L".jpg", L".jpeg", L".png", L".bmp", L".gif",
@@ -47,10 +60,21 @@ struct file_list
     uint16_t current;
 };
 
+// TODO : better naming this
+struct render_state
+{
+    GLuint tex;
+    int    w, h;
+    int    rotation;
+};
+
 static int g_win_w = WINDOW_START_W;
 static int g_win_h = WINDOW_START_H;
 
-struct file_list g_files = {0};
+static struct file_list    g_files  = {0};
+static struct render_state g_render = {0};
+
+static IWICImagingFactory *g_wic = NULL;
 
 // DEBUG
 //
@@ -93,6 +117,14 @@ static inline void vfree(void *ptr)
 //
 // OPENGL
 //
+
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE (0x812F)
+#endif
+
+#ifndef GL_BGRA
+#define GL_BGRA (0x80E1)
+#endif
 
 struct gl_context
 {
@@ -149,14 +181,275 @@ static void opengl_cleanup(HWND hwnd)
     }
 }
 
+static GLuint opengl_texture_upload(BYTE *buf, UINT w, UINT h)
+{
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA, w, h, 0, GL_BGRA, GL_UNSIGNED_BYTE, buf);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    // dprintf("texture_upload : alloc + upload : %.3fms\n", ZONE_ELAPSED_MS());
+
+    return tex;
+}
+
+//
+// WIC
+//
+
+static HRESULT wic_init(void)
+{
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
+    {
+        return hr;
+    }
+
+    hr = CoCreateInstance(&CLSID_WICImagingFactory,
+                          NULL,
+                          CLSCTX_INPROC_SERVER,
+                          &IID_IWICImagingFactory,
+                          (void **)&g_wic);
+    return hr;
+}
+
+static void wic_cleanup(void)
+{
+    if (g_wic) IWICImagingFactory_Release(g_wic);
+    CoUninitialize();
+}
+
+static bool wic_decode(const wchar_t *path, BYTE *out_buf, UINT *out_w, UINT *out_h)
+{
+    if (!path || !out_buf || !out_w || !out_h) return false;
+
+    IWICBitmapDecoder     *decoder = NULL;
+    IWICBitmapFrameDecode *frame   = NULL;
+    IWICFormatConverter   *conv    = NULL;
+
+    bool result = false;
+
+    HRESULT hr;
+    hr = IWICImagingFactory_CreateDecoderFromFilename(g_wic, path, NULL, GENERIC_READ,
+                                                      WICDecodeMetadataCacheOnDemand, &decoder);
+    if (FAILED(hr)) goto done;
+
+    hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
+    if (FAILED(hr)) goto done;
+
+    hr = IWICImagingFactory_CreateFormatConverter(g_wic, &conv);
+    if (FAILED(hr)) goto done;
+
+    hr = IWICFormatConverter_Initialize(conv, (IWICBitmapSource *)frame,
+                                        &GUID_WICPixelFormat32bppBGRA,
+                                        WICBitmapDitherTypeNone, NULL, 0.0,
+                                        WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) goto done;
+
+    IWICFormatConverter_GetSize(conv, out_w, out_h);
+
+    hr = IWICFormatConverter_CopyPixels(conv, NULL,
+                                        (*out_w) * 4,
+                                        (*out_w) * (*out_h) * 4,
+                                        out_buf);
+    if (FAILED(hr)) goto done;
+
+    result = true;
+
+done:
+    if (conv) IWICFormatConverter_Release(conv);
+    if (frame) IWICBitmapFrameDecode_Release(frame);
+    if (decoder) IWICBitmapDecoder_Release(decoder);
+
+    // TODO : add timing information
+    dprintf("decode_wic: %ux%u %s\n", *out_w, *out_h, result ? "OK" : "ERROR");
+
+    return result;
+}
+
+//
+// TURBO JPEG
+//
+
+static bool turbojpeg_decode(const wchar_t *path, BYTE *buf, UINT *out_w, UINT *out_h)
+{
+    if (!path || !buf || !out_w || !out_h) return false;
+
+    // TODO : when multithreaded, each thread will need its own handle
+    static tjhandle handle = NULL;
+    if (!handle) handle = tjInitDecompress();
+
+    BYTE  *file_buf = NULL;
+    bool   result   = false;
+    HANDLE f        = INVALID_HANDLE_VALUE;
+
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                    OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (f == INVALID_HANDLE_VALUE) goto done;
+
+    LARGE_INTEGER file_size;
+    if (!GetFileSizeEx(f, &file_size)) goto done;
+
+    file_buf = vmalloc((size_t)file_size.QuadPart);
+    if (!file_buf) goto done;
+
+    DWORD bytes_read = 0;
+    if (!ReadFile(f, file_buf, (DWORD)file_size.QuadPart, &bytes_read, NULL) ||
+        bytes_read != (DWORD)file_size.QuadPart) goto done;
+
+    CloseHandle(f);
+    f = INVALID_HANDLE_VALUE;
+
+    int w, h, subsamp, colour_space;
+    if (tjDecompressHeader3(handle, file_buf, (unsigned long)bytes_read,
+                            &w, &h, &subsamp, &colour_space) < 0) goto done;
+
+    if (tjDecompress2(handle, file_buf, (unsigned long)bytes_read,
+                      buf, w, 0, h, TJPF_BGRA, TJFLAG_FASTDCT) < 0) goto done;
+
+    *out_w = (UINT)w;
+    *out_h = (UINT)h;
+
+    result = true;
+
+done:
+    if (f != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(f);
+    }
+
+    if (file_buf)
+    {
+        vfree(file_buf);
+    }
+
+    if (!result)
+    {
+        dprintf("decode_jpeg_turbo: %s\n", tjGetErrorStr2(handle));
+    }
+
+    dprintf("decode_jpeg_turbo: %ux%u\n", *out_w, *out_h);
+
+    return result;
+}
+
+//
+// DECODE
+//
+
+static bool decode_image(const wchar_t *path, BYTE *buf, UINT *w, UINT *h)
+{
+    bool result = false;
+
+    // TODO : we could save the extension info when loading the paths?
+    //  enum { IMAGE_JPG ... }
+    const wchar_t *ext = wcsrchr(path, L'.');
+    if (ext)
+    {
+        if (_wcsicmp(ext, L".jpg") == 0 || _wcsicmp(ext, L".jpeg") == 0)
+        {
+            result = turbojpeg_decode(path, buf, w, h);
+        }
+
+        // try again / defualt with wic
+        if (!result) result = wic_decode(path, buf, w, h);
+    }
+    else
+    {
+        dprintf("decode_image : ext fail\n");
+    }
+
+    return result;
+}
+
 //
 // RENDER
 //
+
+static void image_show_current(void)
+{
+    if (g_files.count > 0)
+    {
+        UINT     w = 0, h = 0;
+        BYTE    *image = vmalloc(IMAGE_PREALLOC_SIZE);
+        wchar_t *path  = g_files.paths[g_files.current];
+
+        dprintf("uploading image %ls\n", path);
+        bool res = decode_image(path, image, &w, &h);
+        if (!res) dprintf("image decode failed\n");
+
+        g_render.tex = opengl_texture_upload(image, w, h);
+        g_render.w   = w;
+        g_render.h   = h;
+
+        vfree(image);
+    }
+}
 
 static void image_render(void)
 {
     glViewport(0, 0, g_win_w, g_win_h);
     glClear(GL_COLOR_BUFFER_BIT);
+
+    if (!g_render.tex || g_files.count == 0) return;
+
+    int is_sideways = (g_render.rotation % 180 != 0);
+    int fit_w       = is_sideways ? g_render.h : g_render.w;
+    int fit_h       = is_sideways ? g_render.w : g_render.h;
+
+    float sx    = (float)g_win_w / (float)fit_w;
+    float sy    = (float)g_win_h / (float)fit_h;
+    float fit   = (sx < sy) ? sx : sy;
+    float scale = fit * powf(1.15f, 1.0f);
+
+    // 3. Build quad dimensions in UNROTATED image space
+    float dw = g_render.w * scale;
+    float dh = g_render.h * scale;
+
+    float cx = g_win_w * 0.5f;
+    float cy = g_win_h * 0.5f;
+
+    float x0 = cx - dw * 0.5f, y0 = cy - dh * 0.5f;
+    float x1 = cx + dw * 0.5f, y1 = cy + dh * 0.5f;
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, g_win_w, g_win_h, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    // Rotate unrotated quad around center
+    glTranslatef(cx, cy, 0.0f);
+    glRotatef((float)g_render.rotation, 0.0f, 0.0f, 1.0f);
+    glTranslatef(-cx, -cy, 0.0f);
+
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, g_render.tex);
+    glColor4f(1, 1, 1, 1);
+    glBegin(GL_QUADS);
+    {
+        glTexCoord2f(0.0f, 0.0f);
+        glVertex2f(x0, y0);
+
+        glTexCoord2f(1.0f, 0.0f);
+        glVertex2f(x1, y0);
+
+        glTexCoord2f(1.0f, 1.0f);
+        glVertex2f(x1, y1);
+
+        glTexCoord2f(0.0f, 1.0f);
+        glVertex2f(x0, y1);
+    }
+    glEnd();
+    glDisable(GL_TEXTURE_2D);
 }
 
 //
@@ -178,7 +471,7 @@ static int is_ext_supported(const wchar_t *name)
 
 static void scan_directory(const wchar_t *dir, size_t len)
 {
-    dprintf("scan_directory : %ls\n", dir);
+    dprintf("scan_directory : %ls (%u)\n", dir, len);
 
     if (!g_files.data)
         g_files.data = vmalloc(FILES_MAX_COUNT * MAX_PATH * sizeof(wchar_t));
@@ -265,6 +558,8 @@ static void scan_from_path(const wchar_t *path)
         if (sep)
         {
             *sep = L'\0';
+            len  = wcslen(dir);
+            // len = (size_t)(sep) - (size_t)(dir);
             scan_directory(dir, len);
         }
     }
@@ -292,14 +587,65 @@ static void scan_from_path(const wchar_t *path)
 // WIN MAIN/PROC
 //
 
+static void window_update_title(HWND hWnd)
+{
+    if (g_files.count == 0)
+    {
+        SetWindowTextW(hWnd, L"Pokaz - no images found");
+        return;
+    }
+
+    const wchar_t *path = g_files.paths[g_files.current];
+    const wchar_t *name = wcsrchr(path, L'\\');
+    name                = name ? name + 1 : path;
+
+    wchar_t title[256] = {0};
+    swprintf_s(title, 2048, L"[%d / %d]  %s  (%d \u00d7 %d)",
+               g_files.current + 1, g_files.count, name, g_render.w, g_render.h);
+
+    SetWindowTextW(hWnd, title);
+}
+
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
     {
         case WM_KEYDOWN:
-            if (wParam == VK_ESCAPE)
+            switch (wParam)
             {
-                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                case VK_ESCAPE:
+                {
+                    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    return 0;
+                }
+                case VK_RIGHT:
+                case VK_NEXT:
+                case 'D':
+                {
+                    if (g_files.count > 0)
+                    {
+                        g_files.current = (g_files.current + 1) % g_files.count;
+                        InvalidateRect(hwnd, NULL, FALSE);
+                    }
+                    return 0;
+                }
+                case VK_LEFT:
+                case VK_PRIOR:
+                case 'A':
+                {
+                    if (g_files.count > 0)
+                    {
+                        g_files.current = (g_files.current + g_files.count - 1) % g_files.count;
+                        InvalidateRect(hwnd, NULL, FALSE);
+                    }
+                    return 0;
+                }
+                case 'R':
+                {
+                    g_render.rotation = (g_render.rotation + 90) % 360;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                }
             }
             return 0;
 
@@ -310,6 +656,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             if (DragQueryFileW(hDrop, 0, buf, MAX_PATH))
             {
                 scan_from_path(buf);
+                InvalidateRect(hwnd, NULL, FALSE);
             }
 
             DragFinish(hDrop);
@@ -332,6 +679,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             PAINTSTRUCT ps = {0};
             BeginPaint(hwnd, &ps);
 
+            window_update_title(hwnd);
+            image_show_current();
             image_render();
             SwapBuffers(g_gl.hdc);
 
@@ -341,7 +690,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 
         case WM_CLOSE:
         {
+            dprintf("Shutting down : WIC\n");
+            wic_cleanup();
+
+            dprintf("Shutting down : opengl\n");
             opengl_cleanup(hwnd);
+
             DestroyWindow(hwnd);
             return 0;
         }
@@ -367,6 +721,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         freopen_s(&fp, "CONOUT$", "w", stderr);
     }
 #endif
+
+    HRESULT hr = wic_init();
+    if (FAILED(hr))
+    {
+        dprintf("wic_init failed: 0x%08X\n", (unsigned int)hr);
+        return 1; // Exit early since WIC isn't usable
+    }
 
     int     argc = 0;
     LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
