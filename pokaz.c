@@ -68,6 +68,11 @@ struct render_state
 
     int   rotation;
     float zoom;
+
+    int   drag_start_x, drag_start_y;
+    float pan_start_x, pan_start_y;
+    float pan_x, pan_y;
+    bool  dragging;
 };
 
 static int g_win_w = WINDOW_START_W;
@@ -128,7 +133,7 @@ static inline void *vmalloc(size_t size)
 
 static inline void vfree(void *ptr)
 {
-    if (ptr) VirtualFree(ptr, 0, MEM_RELEASE);
+    VirtualFree(ptr, 0, MEM_RELEASE);
 }
 
 //
@@ -295,8 +300,11 @@ done:
     if (frame) IWICBitmapFrameDecode_Release(frame);
     if (decoder) IWICBitmapDecoder_Release(decoder);
 
-    double time_elapsed = time_in_ms() - time_start;
-    dprintf("decode_wic: %ux%u %.3fms, %s\n", *out_w, *out_h, time_elapsed, result ? "OK" : "ERROR");
+    if (0)
+    {
+        double time_elapsed = time_in_ms() - time_start;
+        dprintf("decode_wic: %ux%u %.3fms, %s\n", *out_w, *out_h, time_elapsed, result ? "OK" : "ERROR");
+    }
 
     return result;
 }
@@ -364,8 +372,11 @@ done:
         dprintf("decode_jpeg_turbo: %s\n", tjGetErrorStr2(handle));
     }
 
-    double time_elapsed = time_in_ms() - time_start;
-    dprintf("turbojpeg_decode: %ux%u %.3fms, %s\n", *out_w, *out_h, time_elapsed, result ? "OK" : "ERROR");
+    if (0)
+    {
+        double time_elapsed = time_in_ms() - time_start;
+        dprintf("turbojpeg_decode: %ux%u %.3fms, %s\n", *out_w, *out_h, time_elapsed, result ? "OK" : "ERROR");
+    }
 
     return result;
 }
@@ -734,6 +745,62 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             }
             return 0;
 
+        case WM_LBUTTONDOWN:
+        {
+            int mx = GET_X_LPARAM(lParam);
+            int my = GET_Y_LPARAM(lParam);
+
+            // mouse down in the main image - start pan drag
+            g_render.dragging     = true;
+            g_render.drag_start_x = mx;
+            g_render.drag_start_y = my;
+            g_render.pan_start_x  = g_render.pan_x;
+            g_render.pan_start_y  = g_render.pan_y;
+
+            SetCapture(hwnd);
+            return 0;
+        }
+
+        case WM_LBUTTONUP:
+        {
+            // int mx = GET_X_LPARAM(lParam);
+            // int my = GET_Y_LPARAM(lParam);
+
+            g_render.dragging = false;
+            ReleaseCapture();
+            return 0;
+        }
+
+        case WM_MOUSEMOVE:
+        {
+            int mx = GET_X_LPARAM(lParam);
+            int my = GET_Y_LPARAM(lParam);
+
+            if (g_render.dragging)
+            {
+                g_render.pan_x = g_render.pan_start_x + (float)(mx - g_render.drag_start_x);
+                g_render.pan_y = g_render.pan_start_y + (float)(my - g_render.drag_start_y);
+
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_MOUSEWHEEL:
+        {
+            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+
+            POINT lpPoint = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            BOOL  res     = ScreenToClient(hwnd, &lpPoint);
+
+            if (res)
+            {
+                g_render.zoom += (delta > 0) ? 1.0f : -1.0f;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
+
         case WM_DROPFILES:
         {
             HDROP   hDrop         = (HDROP)wParam;
@@ -839,8 +906,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     if (!RegisterClassExW(&wc))
     {
-        // TODO : send errors to both the console and or the debuger?
-        dprintf("[ERROR] Failed to register window class.\n");
+        dprintf("RegisterClassExW failed\n");
         return 1;
     }
 
@@ -854,14 +920,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     if (!hwnd)
     {
-        dprintf("[ERROR] Failed to create window.\n");
+        dprintf("CreateWindowEx failed\n");
         UnregisterClassW(class_name, hInstance);
         return 1;
     }
 
     if (!opengl_init(hwnd))
     {
-        dprintf("[ERROR] Failed to initialize OpenGL context.\n");
+        dprintf("opengl_init failed\n");
         DestroyWindow(hwnd);
         UnregisterClassW(class_name, hInstance);
         return 1;
