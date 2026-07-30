@@ -13,6 +13,11 @@
 
 #include <GL/gl.h>
 
+#define SPNG_USE_MINIZ
+#define SPNG_STATIC
+#include "deps/spng.h"
+#include "deps/miniz.h"
+
 #define LIBJPEG_TURBO_STATIC
 #include <turbojpeg.h>
 #pragma comment(lib, "turbojpeg-static")
@@ -81,7 +86,8 @@ static int g_win_h = WINDOW_START_H;
 static struct file_list    g_files  = {0};
 static struct render_state g_render = {0};
 
-static IWICImagingFactory *g_wic = NULL;
+static IWICImagingFactory *g_wic       = NULL;
+static tjhandle            g_tj_handle = NULL;
 
 //
 // DEBUG
@@ -210,19 +216,50 @@ static void opengl_cleanup(HWND hwnd)
     }
 }
 
-static GLuint opengl_texture_upload(BYTE *buf, UINT w, UINT h)
+typedef enum
 {
+    PIXEL_FORMAT_RGB8,  // 3 bytes/px: R,G,B
+    PIXEL_FORMAT_RGBA8, // 4 bytes/px: R,G,B,A
+    PIXEL_FORMAT_BGRA8, // 4 bytes/px: B,G,R,A
+} pixel_format_t;
+
+static GLuint opengl_texture_upload(BYTE *buf, UINT w, UINT h, pixel_format_t format)
+{
+    GLenum gl_format       = GL_RGBA;
+    GLenum internal_format = GL_RGBA8;
+    GLint  alignment       = 4;
+
+    switch (format)
+    {
+        case PIXEL_FORMAT_RGB8:
+            gl_format       = GL_RGB;
+            internal_format = GL_RGB8;
+            alignment       = 1;
+            break;
+        case PIXEL_FORMAT_RGBA8:
+            gl_format       = GL_RGBA;
+            internal_format = GL_RGBA8;
+            alignment       = 4;
+            break;
+        case PIXEL_FORMAT_BGRA8:
+            gl_format       = GL_BGRA;
+            internal_format = GL_RGBA8;
+            alignment       = 4;
+            break;
+    }
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA, w, h, 0, GL_BGRA, GL_UNSIGNED_BYTE, buf);
-
     glBindTexture(GL_TEXTURE_2D, 0);
 
     // dprintf("texture_upload : alloc + upload : %.3fms\n", time);
@@ -256,7 +293,7 @@ static void wic_cleanup(void)
     CoUninitialize();
 }
 
-static bool wic_decode(const wchar_t *path, BYTE *out_buf, UINT *out_w, UINT *out_h)
+static bool wic_decode(const wchar_t *path, BYTE *out_buf, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
 {
     if (!path || !out_buf || !out_w || !out_h) return false;
 
@@ -293,7 +330,8 @@ static bool wic_decode(const wchar_t *path, BYTE *out_buf, UINT *out_w, UINT *ou
                                         out_buf);
     if (FAILED(hr)) goto done;
 
-    result = true;
+    *out_format = PIXEL_FORMAT_BGRA8;
+    result      = true;
 
 done:
     if (conv) IWICFormatConverter_Release(conv);
@@ -313,13 +351,9 @@ done:
 // TURBO JPEG
 //
 
-static bool turbojpeg_decode(const wchar_t *path, BYTE *buf, UINT *out_w, UINT *out_h)
+static bool turbojpeg_decode(tjhandle handle, const wchar_t *path, BYTE *buf, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
 {
     if (!path || !buf || !out_w || !out_h) return false;
-
-    // TODO : when multithreaded, each thread will need its own handle
-    static tjhandle handle = NULL;
-    if (!handle) handle = tjInitDecompress();
 
     BYTE  *file_buf = NULL;
     bool   result   = false;
@@ -334,6 +368,7 @@ static bool turbojpeg_decode(const wchar_t *path, BYTE *buf, UINT *out_w, UINT *
     LARGE_INTEGER file_size;
     if (!GetFileSizeEx(f, &file_size)) goto done;
 
+    // TODO : prealloc
     file_buf = vmalloc((size_t)file_size.QuadPart);
     if (!file_buf) goto done;
 
@@ -351,8 +386,9 @@ static bool turbojpeg_decode(const wchar_t *path, BYTE *buf, UINT *out_w, UINT *
     if (tjDecompress2(handle, file_buf, (unsigned long)bytes_read,
                       buf, w, 0, h, TJPF_BGRA, TJFLAG_FASTDCT) < 0) goto done;
 
-    *out_w = (UINT)w;
-    *out_h = (UINT)h;
+    *out_w      = (UINT)w;
+    *out_h      = (UINT)h;
+    *out_format = PIXEL_FORMAT_BGRA8; // TJPF_BGRA
 
     result = true;
 
@@ -382,10 +418,92 @@ done:
 }
 
 //
+// SPNG
+//
+
+static bool decode_png_spng(const wchar_t *path, BYTE **out_buf, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
+{
+    if (!path || !out_buf || !out_w || !out_h) return false;
+
+    BYTE     *file_buf = NULL;
+    spng_ctx *ctx      = NULL;
+    bool      result   = false;
+    HANDLE    f        = INVALID_HANDLE_VALUE;
+
+    double time_start = time_in_ms();
+
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                    OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (f == INVALID_HANDLE_VALUE) goto done;
+
+    LARGE_INTEGER file_size;
+    if (!GetFileSizeEx(f, &file_size)) goto done;
+
+    file_buf = vmalloc((size_t)file_size.QuadPart);
+    if (!file_buf) goto done;
+
+    DWORD bytes_read = 0;
+    if (!ReadFile(f, file_buf, (DWORD)file_size.QuadPart, &bytes_read, NULL) ||
+        bytes_read != (DWORD)file_size.QuadPart) goto done;
+
+    CloseHandle(f);
+    f = INVALID_HANDLE_VALUE;
+
+    ctx = spng_ctx_new(0);
+    if (!ctx) goto done;
+
+    if (spng_set_png_buffer(ctx, file_buf, (size_t)bytes_read) != 0) goto done;
+
+    struct spng_ihdr ihdr = {0};
+    if (spng_get_ihdr(ctx, &ihdr) != 0) goto done;
+
+    bool has_alpha = (ihdr.color_type == SPNG_COLOR_TYPE_TRUECOLOR_ALPHA ||
+                      ihdr.color_type == SPNG_COLOR_TYPE_GRAYSCALE_ALPHA);
+
+    int fmt = has_alpha ? SPNG_FMT_RGBA8 : SPNG_FMT_RGB8;
+
+    size_t out_size = 0;
+    if (spng_decoded_image_size(ctx, fmt, &out_size) != 0) goto done;
+
+    if (spng_decode_image(ctx, *out_buf, out_size, fmt, 0) != 0) goto done;
+
+    *out_w = (UINT)ihdr.width;
+    *out_h = (UINT)ihdr.height;
+
+    *out_format = has_alpha ? PIXEL_FORMAT_RGBA8 : PIXEL_FORMAT_RGB8;
+
+    result = true;
+
+done:
+    if (f != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(f);
+    }
+
+    if (file_buf)
+    {
+        vfree(file_buf);
+    }
+
+    if (ctx)
+    {
+        spng_ctx_free(ctx);
+    }
+
+    if (0)
+    {
+        double time_elapsed = time_in_ms() - time_start;
+        dprintf("decode_png_spng: %ux%u %.3fms, %s\n", *out_w, *out_h, time_elapsed, result ? "OK" : "ERROR");
+    }
+
+    return result;
+}
+
+//
 // DECODE
 //
 
-static bool decode_image(const wchar_t *path, BYTE *buf, UINT *w, UINT *h)
+static bool decode_image(tjhandle tj_handle, const wchar_t *path, BYTE *buf, UINT *w, UINT *h, pixel_format_t *out_format)
 {
     bool result = false;
 
@@ -396,11 +514,11 @@ static bool decode_image(const wchar_t *path, BYTE *buf, UINT *w, UINT *h)
     {
         if (_wcsicmp(ext, L".jpg") == 0 || _wcsicmp(ext, L".jpeg") == 0)
         {
-            result = turbojpeg_decode(path, buf, w, h);
+            result = turbojpeg_decode(tj_handle, path, buf, w, h, out_format);
         }
 
         // try again / defualt with wic
-        if (!result) result = wic_decode(path, buf, w, h);
+        if (!result) result = wic_decode(path, buf, w, h, out_format);
     }
     else
     {
@@ -887,10 +1005,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         scan_from_path(argv[1]);
         LocalFree(argv);
     }
-    else
-    {
-        dprintf("no paths found on the command line\n");
-    }
 
     LPCWSTR class_name  = L"PokazWC";
     LPCWSTR window_name = L"Pokaz";
@@ -933,6 +1047,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         return 1;
     }
 
+    if (!g_tj_handle)
+    {
+        g_tj_handle = tjInitDecompress();
+        if (!g_tj_handle)
+        {
+            dprintf("tjInitDecompress failed on main thread\n");
+            return 1;
+        }
+    }
+
+
     dprintf("setup finished\n");
 
     image_show_current();
@@ -949,6 +1074,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     UnregisterClassW(class_name, hInstance);
 
     if (g_files.data) vfree(g_files.data);
+    if (g_tj_handle) tjDestroy(g_tj_handle);
 
     return (int)msg.wParam;
 }
