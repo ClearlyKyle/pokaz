@@ -527,6 +527,62 @@ static bool decode_image(tjhandle tj_handle, const wchar_t *path, BYTE *buf, UIN
 
     return result;
 }
+//
+// SLIDESHOW
+//
+
+struct slideshow
+{
+    uint16_t speed_index;
+    bool     active;
+};
+
+static const int SLIDESHOW_SPEEDS[] = {500, 1000, 2000, 3000, 5000, 8000, 12000}; // ms
+#define SLIDESHOW_SPEED_COUNT   ARRAY_LENGTH(SLIDESHOW_SPEEDS)
+#define SLIDESHOW_TIMER_ID      (1)
+#define SLIDESHOW_SPEED_DEFAULT (2)
+
+static struct slideshow g_slide = {.speed_index = SLIDESHOW_SPEED_DEFAULT};
+
+static void slideshow_rearm(HWND hWnd)
+{
+    if (g_slide.active)
+    {
+        KillTimer(hWnd, SLIDESHOW_TIMER_ID);
+        SetTimer(hWnd, SLIDESHOW_TIMER_ID, SLIDESHOW_SPEEDS[g_slide.speed_index], NULL);
+    }
+}
+
+static void slideshow_start(HWND hWnd)
+{
+    dprintf("slideshow START\n");
+
+    if (g_files.count <= 1) return;
+
+    g_slide.active = true;
+    slideshow_rearm(hWnd);
+}
+
+static void slideshow_stop(HWND hWnd)
+{
+    dprintf("slideshow STOP\n");
+
+    g_slide.active = false;
+    KillTimer(hWnd, SLIDESHOW_TIMER_ID);
+}
+
+static inline void slideshow_toggle(HWND hWnd)
+{
+    g_slide.active ? slideshow_stop(hWnd) : slideshow_start(hWnd);
+}
+
+static void slideshow_advance(void)
+{
+    if (g_files.count <= 1) return;
+
+    // same as a "right" move
+    g_files.current = (g_files.current + 1) % g_files.count;
+}
 
 //
 // RENDER
@@ -772,8 +828,23 @@ static void window_update_title(HWND hWnd)
     name                = name ? name + 1 : path;
 
     wchar_t title[256] = {0};
-    swprintf_s(title, 2048, L"[%d / %d]  %s  (%d \u00d7 %d)",
-               g_files.current + 1, g_files.count, name, g_render.w, g_render.h);
+    if (g_slide.active)
+    {
+        double secs = SLIDESHOW_SPEEDS[g_slide.speed_index] / 1000.0;
+
+        swprintf_s(title, 256, L"[\u25b6 %.1fs] [%d / %d] %s (%d \u00d7 %d)",
+                   secs,
+                   g_files.current + 1, g_files.count,
+                   name,
+                   g_render.w, g_render.h);
+    }
+    else
+    {
+        swprintf_s(title, 256, L"[%d / %d] %s (%d \u00d7 %d)",
+                   g_files.current + 1, g_files.count,
+                   name,
+                   g_render.w, g_render.h);
+    }
 
     SetWindowTextW(hWnd, title);
 }
@@ -782,13 +853,25 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 {
     switch (uMsg)
     {
+
+        case WM_TIMER:
+        {
+            if (wParam == SLIDESHOW_TIMER_ID)
+            {
+                slideshow_advance();
+                image_show_current();
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
+
         case WM_KEYDOWN:
             switch (wParam)
             {
                 case VK_ESCAPE:
                 {
                     PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                    return 0;
+                    break;
                 }
                 case VK_RIGHT:
                 case VK_NEXT:
@@ -858,6 +941,35 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 {
                     image_reset_view();
                     InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                }
+                case VK_SPACE:
+                {
+                    slideshow_toggle(hwnd);
+                    image_show_current();
+                    window_update_title(hwnd);
+                    break;
+                }
+                case VK_OEM_PLUS:
+                case VK_ADD:
+                {
+                    if (g_slide.speed_index > 0)
+                    {
+                        g_slide.speed_index--;
+                        slideshow_rearm(hwnd);
+                        window_update_title(hwnd);
+                    }
+                    break;
+                }
+                case VK_OEM_MINUS:
+                case VK_SUBTRACT:
+                {
+                    if (g_slide.speed_index < (SLIDESHOW_SPEED_COUNT - 1))
+                    {
+                        g_slide.speed_index++;
+                        slideshow_rearm(hwnd);
+                        window_update_title(hwnd);
+                    }
                     break;
                 }
             }
