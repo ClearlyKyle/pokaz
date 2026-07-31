@@ -47,6 +47,8 @@
 #define IMAGE_MAX_H         (4096)
 #define IMAGE_PREALLOC_SIZE (IMAGE_MAX_W * IMAGE_MAX_H * 4)
 
+#define WM_DECODED_IMAGE_READY (WM_APP + 1)
+
 static const wchar_t *SUPPORTED_EXTENSIONS[] = {
     L".jpg", L".jpeg", L".png", L".bmp", L".gif",
     L".tiff", L".tif", L".ico", L".webp", L".wdp",
@@ -527,6 +529,154 @@ static bool decode_image(tjhandle tj_handle, const wchar_t *path, BYTE *buf, UIN
 
     return result;
 }
+
+//
+// CACHE
+//
+
+#define CACHE_CAPACITY (5) // current, next, previous
+#define THREAD_COUNT   (2)
+
+enum cache_state
+{
+    CACHE_EMPTY,
+    CACHE_NEEDS_DECODING,
+    CACHE_DECODING,
+    CACHE_READY
+};
+
+struct thread_info
+{
+    int      id;
+    tjhandle tj_handle;
+};
+
+struct cache_entry
+{
+    uint16_t         index;
+    enum cache_state state;
+
+    pixel_format_t format;
+    BYTE          *pixels;
+    UINT           w, h;
+};
+
+struct image_cache
+{
+    CRITICAL_SECTION   lock;
+    struct cache_entry entries[CACHE_CAPACITY];
+    int                target_index; // The index the user is currently looking at
+
+    HANDLE threads[THREAD_COUNT];
+    HANDLE semaphore;
+    bool   running;
+};
+
+static struct image_cache g_cache = {0};
+
+static DWORD WINAPI background_prefetch_thread(LPVOID arg)
+{
+    HWND     hwnd      = (HWND)arg;
+    tjhandle tj_handle = tjInitDecompress();
+    DWORD    thread_id = GetCurrentThreadId();
+
+    for (;;)
+    {
+        WaitForSingleObject(g_cache.semaphore, INFINITE);
+        if (!g_cache.running) break;
+
+        int  i     = 0;
+        bool found = false;
+        EnterCriticalSection(&g_cache.lock);
+        for (; i < CACHE_CAPACITY; i++)
+        {
+            if (g_cache.entries[i].state == CACHE_NEEDS_DECODING)
+            {
+                g_cache.entries[i].state = CACHE_DECODING;
+                found                    = true;
+                break;
+            }
+        }
+        LeaveCriticalSection(&g_cache.lock);
+        if (!found) continue;
+
+        // target is not in the cache
+        int target = g_cache.entries[i].index;
+        // dprintf("thread %u decoding %d\n", thread_id, target);
+
+        bool res = decode_image(tj_handle, g_files.paths[target],
+                                g_cache.entries[i].pixels,
+                                &g_cache.entries[i].w,
+                                &g_cache.entries[i].h,
+                                &g_cache.entries[i].format);
+        if (res)
+        {
+            // TODO : do we need to lock here?
+            EnterCriticalSection(&g_cache.lock);
+
+            g_cache.entries[i].state = CACHE_READY;
+
+            PostMessageW(hwnd, WM_DECODED_IMAGE_READY, 0, (LPARAM)&g_cache.entries[i]);
+
+            LeaveCriticalSection(&g_cache.lock);
+        }
+    }
+
+    if (tj_handle) tjDestroy(tj_handle);
+
+    return 0;
+}
+
+static void cache_init(HWND hwnd)
+{
+    InitializeCriticalSection(&g_cache.lock);
+    g_cache.semaphore    = CreateSemaphore(NULL, 0, CACHE_CAPACITY, NULL);
+    g_cache.target_index = 0;
+    g_cache.running      = true;
+
+    for (uint16_t i = 0; i < CACHE_CAPACITY; i++)
+    {
+        g_cache.entries[i].index  = (uint16_t)-1;
+        g_cache.entries[i].state  = CACHE_EMPTY;
+        g_cache.entries[i].pixels = vmalloc(IMAGE_PREALLOC_SIZE);
+    }
+
+    for (uint16_t i = 0; i < THREAD_COUNT; i++)
+    {
+        g_cache.threads[i] = CreateThread(NULL, 0, background_prefetch_thread, (LPVOID)hwnd, 0, NULL);
+    }
+}
+
+static void cache_cleanup(void)
+{
+    g_cache.running = false;
+    ReleaseSemaphore(g_cache.semaphore, THREAD_COUNT, NULL);
+
+    DWORD result = WaitForMultipleObjects(THREAD_COUNT, g_cache.threads, TRUE, INFINITE);
+    if (result == WAIT_FAILED)
+    {
+        DWORD err = GetLastError();
+        dprintf("WaitForMultipleObjects failed: %lu\n", err);
+    }
+
+    for (uint16_t i = 0; i < THREAD_COUNT; i++)
+    {
+        if (!CloseHandle(g_cache.threads[i])) dprintf("g_cache.threads[%u] close issue\n", i);
+    }
+
+    if (!CloseHandle(g_cache.semaphore)) dprintf("g_cache.semaphore close issue\n");
+
+    for (uint16_t i = 0; i < CACHE_CAPACITY; i++)
+    {
+        if (g_cache.entries[i].pixels)
+        {
+            vfree(g_cache.entries[i].pixels);
+        }
+    }
+
+    DeleteCriticalSection(&g_cache.lock);
+}
+
 //
 // SLIDESHOW
 //
@@ -596,28 +746,114 @@ static inline void image_reset_view(void)
     g_render.rotation = 0;
 }
 
+static uint16_t image_map_index(int offset)
+{
+    if (g_files.count == 0) return 0;
+
+    int count   = (int)g_files.count;
+    int current = (int)g_files.current;
+
+    int pos = (current + offset) % count;
+    if (pos < 0) pos += count;
+
+
+    return (uint16_t)pos;
+}
+
 static void image_show_current(void)
 {
-    if (g_files.count > 0)
+    if (g_files.count == 0) return;
+
+    image_reset_view();
+    uint16_t current_idx = image_map_index(0);
+
+    dprintf("image_show_current : %u\n", current_idx);
+
+    BYTE          *pixels_to_upload = NULL;
+    pixel_format_t format           = 0;
+    UINT           w = 0, h = 0;
+    bool           cache_hit = false;
+
+    EnterCriticalSection(&g_cache.lock);
     {
-        image_reset_view();
+        for (int j = 0; j < CACHE_CAPACITY; j++)
+        {
+            if (g_cache.entries[j].index == current_idx &&
+                g_cache.entries[j].state == CACHE_READY)
+            {
+                pixels_to_upload = g_cache.entries[j].pixels;
+                w                = g_cache.entries[j].w;
+                h                = g_cache.entries[j].h;
+                format           = g_cache.entries[j].format;
+                cache_hit        = true;
+                break;
+            }
+        }
+    }
 
-        UINT     w = 0, h = 0;
-        BYTE    *image = vmalloc(IMAGE_PREALLOC_SIZE);
-        wchar_t *path  = g_files.paths[g_files.current];
+    // rebuild the cache around the current index
+    {
+        // TODO : this is very hardcoded, should be based on CACHE_CAPACITY
+        uint16_t to_cache[5] = {
+            image_map_index(0),  // Current image
+            image_map_index(1),  // Next image
+            image_map_index(-1), // Previous image
+            image_map_index(2),  // +2 images ahead
+            image_map_index(-2)  // -2 images behind
+        };
 
-        dprintf("uploading image %ls\n", path);
-        bool res = decode_image(path, image, &w, &h);
-        if (!res) dprintf("image decode failed\n");
+        // when less images than the cache size
+        int active_targets = (g_files.count < 5) ? g_files.count : 5;
+        for (int t = 0; t < active_targets; t++)
+        {
+            uint16_t target = to_cache[t];
 
+            bool already_cached = false;
+            for (uint16_t j = 0; j < CACHE_CAPACITY; j++)
+            {
+                if (g_cache.entries[j].index == target &&
+                    g_cache.entries[j].state != CACHE_EMPTY)
+                {
+                    already_cached = true;
+                    break;
+                }
+            }
+            if (already_cached) continue;
+
+            // Find a slot whose index is NOT in to_cache[] - safe to evict
+            for (uint16_t j = 0; j < CACHE_CAPACITY; j++)
+            {
+                uint16_t cached_idx = g_cache.entries[j].index;
+
+                if (cached_idx != to_cache[0] &&
+                    cached_idx != to_cache[1] &&
+                    cached_idx != to_cache[2] &&
+                    cached_idx != to_cache[3] &&
+                    cached_idx != to_cache[4])
+                {
+                    g_cache.entries[j].state = CACHE_NEEDS_DECODING;
+                    g_cache.entries[j].index = target;
+                    ReleaseSemaphore(g_cache.semaphore, 1, NULL);
+                    break;
+                }
+            }
+        }
+    }
+    LeaveCriticalSection(&g_cache.lock);
+
+    if (cache_hit)
+    {
+        // dprintf("image_show_current : cache hit!\n");
         if (g_render.tex != 0) glDeleteTextures(1, &g_render.tex);
-
-        g_render.tex = opengl_texture_upload(image, w, h);
+        g_render.tex = opengl_texture_upload(pixels_to_upload, w, h, format);
         g_render.w   = w;
         g_render.h   = h;
-
-        vfree(image);
     }
+    else
+    {
+        ReleaseSemaphore(g_cache.semaphore, 1, NULL);
+    }
+}
 }
 
 static void image_render(void)
@@ -827,6 +1063,8 @@ static void window_update_title(HWND hWnd)
     const wchar_t *name = wcsrchr(path, L'\\');
     name                = name ? name + 1 : path;
 
+    uint16_t current_idx = image_map_index(0) + 1;
+
     wchar_t title[256] = {0};
     if (g_slide.active)
     {
@@ -846,13 +1084,50 @@ static void window_update_title(HWND hWnd)
                    g_render.w, g_render.h);
     }
 
+#if 1
+    wchar_t cache_state[64] = {0};
+    EnterCriticalSection(&g_cache.lock);
+    swprintf_s(cache_state, 64, L"[%u, %u, %u, %u, %u]",
+               g_cache.entries[0].index,
+               g_cache.entries[1].index,
+               g_cache.entries[2].index,
+               g_cache.entries[3].index,
+               g_cache.entries[4].index);
+    LeaveCriticalSection(&g_cache.lock);
+
+    wchar_t full[256] = {0};
+    swprintf_s(full, 256, L"%s %s", cache_state, title);
+    SetWindowTextW(hWnd, full);
+#else
     SetWindowTextW(hWnd, title);
+#endif
 }
 
 static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     switch (uMsg)
     {
+        case WM_DECODED_IMAGE_READY:
+        {
+            struct cache_entry *entry = (struct cache_entry *)lParam;
+
+            // can only get here on CACHE_READY state
+            EnterCriticalSection(&g_cache.lock);
+            uint16_t current_index = image_map_index(0);
+            if (entry->index == current_index)
+            {
+                dprintf("WM_DECODED_IMAGE_READY %d\n", entry->index);
+
+                if (g_render.tex != 0) glDeleteTextures(1, &g_render.tex);
+                g_render.tex = opengl_texture_upload(entry->pixels, entry->w, entry->h, entry->format);
+                g_render.w   = entry->w;
+                g_render.h   = entry->h;
+
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            LeaveCriticalSection(&g_cache.lock);
+            return 0;
+        }
 
         case WM_TIMER:
         {
@@ -973,7 +1248,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     break;
                 }
             }
-            return 0;
+            break;
 
         case WM_LBUTTONDOWN:
         {
@@ -1077,6 +1352,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             dprintf("Shutting down : opengl\n");
             opengl_cleanup(hwnd);
 
+            dprintf("Shutting down : cache\n");
+            cache_cleanup();
+
             DestroyWindow(hwnd);
             return 0;
         }
@@ -1169,6 +1447,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     }
 
+    cache_init(hwnd);
 
     dprintf("setup finished\n");
 
