@@ -7,6 +7,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
 #include <windows.h>
+#include <windowsx.h>
 #include <wincodec.h>
 #include <wchar.h>
 #include <shellapi.h>
@@ -626,6 +627,21 @@ static DWORD WINAPI background_prefetch_thread(LPVOID arg)
 
     return 0;
 }
+static void cache_reset(void)
+{
+    EnterCriticalSection(&g_cache.lock);
+
+    for (uint16_t i = 0; i < CACHE_CAPACITY; i++)
+    {
+        g_cache.entries[i].index = (uint16_t)-1;
+        g_cache.entries[i].state = CACHE_EMPTY;
+
+        if (!g_cache.entries[i].pixels)
+            g_cache.entries[i].pixels = vmalloc(IMAGE_PREALLOC_SIZE);
+    }
+
+    LeaveCriticalSection(&g_cache.lock);
+}
 
 static void cache_init(HWND hwnd)
 {
@@ -634,12 +650,7 @@ static void cache_init(HWND hwnd)
     g_cache.target_index = 0;
     g_cache.running      = true;
 
-    for (uint16_t i = 0; i < CACHE_CAPACITY; i++)
-    {
-        g_cache.entries[i].index  = (uint16_t)-1;
-        g_cache.entries[i].state  = CACHE_EMPTY;
-        g_cache.entries[i].pixels = vmalloc(IMAGE_PREALLOC_SIZE);
-    }
+    cache_reset();
 
     for (uint16_t i = 0; i < THREAD_COUNT; i++)
     {
@@ -1221,7 +1232,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 case VK_SPACE:
                 {
                     slideshow_toggle(hwnd);
-                    image_show_current();
+                    // image_show_current();
                     window_update_title(hwnd);
                     break;
                 }
@@ -1310,9 +1321,14 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
         {
             HDROP   hDrop         = (HDROP)wParam;
             wchar_t buf[MAX_PATH] = {0};
+
+            // for now, only care about the first file dropped
             if (DragQueryFileW(hDrop, 0, buf, MAX_PATH))
             {
+                // we need to rebuild and invalidate the cache
                 scan_from_path(buf);
+                cache_reset();
+                image_show_current();
                 InvalidateRect(hwnd, NULL, FALSE);
             }
 
