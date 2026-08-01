@@ -962,12 +962,9 @@ static void scan_directory(const wchar_t *dir, size_t len)
                                            NULL,
                                            0);
 
-    // pattern[pattern_end - 1] = 0; // now we have the base path
-    // pattern would look like : "images\4\*",
-    //  pattern_len = 10                  ^
-    //  base_len    = 9                  ^    (up to the last \)
-    // size_t pattern_len = wcslen(pattern);
-    // size_t base_len    = pattern_len - 1;
+    // pattern would look like : "images\4",
+    // dir look like           : "images\4\*",
+    // len + 1 is to include the "\" we just added
     size_t base_len = len + 1;
 
     if (hf == INVALID_HANDLE_VALUE) return;
@@ -985,7 +982,9 @@ static void scan_directory(const wchar_t *dir, size_t len)
         size_t file_len  = wcslen(fd.cFileName);
         size_t total_len = base_len + file_len + 1; // +1 for null terminator
 
-        // TODO : pack the names tigher
+        if (total_len > MAX_PATH)
+            continue; // or truncate/log, but don't write past the slot
+
         wchar_t *full                = g_files.data + (g_files.count * MAX_PATH);
         g_files.paths[g_files.count] = full;
 
@@ -1003,18 +1002,31 @@ static void scan_directory(const wchar_t *dir, size_t len)
 
 static void scan_from_path(const wchar_t *path)
 {
+    // TODO : timing
+
     dprintf("scan_from_path : %ls\n", path);
 
-    wchar_t dir[MAX_PATH] = {0};
-    wcscpy_s(dir, MAX_PATH, path); // NOTE : do we even need to copy?
+    wchar_t raw[MAX_PATH] = {0};
+    wcscpy_s(raw, MAX_PATH, path);
 
     // strip trailing quotes and backslashes
-    size_t len = wcslen(dir);
-    while (len > 0 &&
-           ((dir[len - 1] == L'"') || (dir[len - 1] == L'\\')))
+    size_t rlen = wcslen(raw);
+    while (rlen > 0 &&
+           ((raw[rlen - 1] == L'"') || (raw[rlen - 1] == L'\\')))
     {
-        dir[--len] = L'\0';
+        raw[--rlen] = L'\0';
     }
+
+    // resolve to a full, absolute path so relative CLI args
+    // (e.g. "image_3.png" or "..\images\9\image_3.png") match
+    // the absolute paths returned by FindFirstFileExW later
+    wchar_t full_clean_path[MAX_PATH] = {0};
+    if (!GetFullPathNameW(raw, MAX_PATH, full_clean_path, NULL))
+        return; // couldn't resolve — bad path
+
+    wchar_t dir[MAX_PATH] = {0};
+    wcscpy_s(dir, MAX_PATH, full_clean_path);
+    size_t len = wcslen(dir);
 
     DWORD attr = GetFileAttributesW(dir);
     if (attr == INVALID_FILE_ATTRIBUTES) return;
@@ -1025,32 +1037,29 @@ static void scan_from_path(const wchar_t *path)
     }
     else
     {
-        // truncate to parent directory
         wchar_t *sep = wcsrchr(dir, L'\\');
         if (sep)
         {
             *sep = L'\0';
             len  = wcslen(dir);
-            // len = (size_t)(sep) - (size_t)(dir);
             scan_directory(dir, len);
         }
+        // sep == NULL should now be unreachable, since
+        // GetFullPathNameW always returns a drive/UNC-rooted path
     }
 
-    // NOTE : if we are given an image path, we set it as current
-    //  but if given a directory we set current as the first image
-    //  we should skip this if given a directory
     for (uint16_t i = 0; i < g_files.count; i++)
     {
-        if (_wcsicmp(g_files.paths[i], path) == 0)
+        if (_wcsicmp(g_files.paths[i], full_clean_path) == 0)
         {
             g_files.current = i;
             break;
         }
     }
 
-    if (0)
+    if (1)
     {
-        dprintf("Loaded images : \n");
+        dprintf("Loaded images from: '%ls'\n", path);
         for (uint16_t i = 0; i < g_files.count; i++)
         {
             dprintf("    %ls %s\n", g_files.paths[i], g_files.current == i ? "<--" : "");
