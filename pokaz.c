@@ -44,6 +44,7 @@
 
 #define FILES_MAX_COUNT (65535)
 
+// handles up to ~64 Megapixel images
 #define IMAGE_MAX_W         (4096)
 #define IMAGE_MAX_H         (4096)
 #define IMAGE_PREALLOC_SIZE (IMAGE_MAX_W * IMAGE_MAX_H * 4)
@@ -61,10 +62,13 @@ static const wchar_t *SUPPORTED_EXTENSIONS[] = {
 
 struct file_list
 {
-    wchar_t *paths[FILES_MAX_COUNT];
     wchar_t *data;
-    size_t   data_used_chars;
-    uint16_t count;
+    size_t   data_used;
+
+    wchar_t  base_path[MAX_PATH];         // C:/folder/images/
+    wchar_t *file_names[FILES_MAX_COUNT]; // image1.jpg, image2.jpg...
+
+    uint16_t paths_count;
     uint16_t current;
 };
 
@@ -89,8 +93,7 @@ static int g_win_h = WINDOW_START_H;
 static struct file_list    g_files  = {0};
 static struct render_state g_render = {0};
 
-static IWICImagingFactory *g_wic       = NULL;
-static tjhandle            g_tj_handle = NULL;
+static void image_full_path(uint16_t index, wchar_t *out, size_t out_cap);
 
 //
 // DEBUG
@@ -190,8 +193,8 @@ static inline bool opengl_init(HWND hwnd)
 
     if (!wglMakeCurrent(g_gl.hdc, g_gl.hglrc)) return false;
 
-    glClearColor(0.0f, 0.3686f, 0.7216f, 1.0f); // pantone 300 C
-    // glClearColor(0.12f, 0.12f, 0.12f, 1.0f);
+    // glClearColor(0.0f, 0.3686f, 0.7216f, 1.0f); // pantone 300 C
+    glClearColor(0.12f, 0.12f, 0.12f, 1.0f);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
     return true;
@@ -274,6 +277,8 @@ static GLuint opengl_texture_upload(BYTE *buf, UINT w, UINT h, pixel_format_t fo
 // WIC
 //
 
+static IWICImagingFactory *g_wic = NULL;
+
 static HRESULT wic_init(void)
 {
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -353,6 +358,8 @@ done:
 //
 // TURBO JPEG
 //
+
+static tjhandle g_tj_handle = NULL;
 
 static bool turbojpeg_decode(tjhandle handle, const wchar_t *path, BYTE *buf, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
 {
@@ -602,10 +609,14 @@ static DWORD WINAPI background_prefetch_thread(LPVOID arg)
         if (!found) continue;
 
         // target is not in the cache
-        int target = g_cache.entries[i].index;
-        // dprintf("thread %u decoding %d\n", thread_id, target);
+        uint16_t target = g_cache.entries[i].index;
 
-        bool res = decode_image(tj_handle, g_files.paths[target],
+        wchar_t full_path[MAX_PATH];
+        image_full_path(target, full_path, MAX_PATH);
+
+        if (0) dprintf("thread %u decoding %u, '%ls'\n", thread_id, target, full_path);
+
+        bool res = decode_image(tj_handle, full_path,
                                 g_cache.entries[i].pixels,
                                 &g_cache.entries[i].w,
                                 &g_cache.entries[i].h,
@@ -718,7 +729,7 @@ static void slideshow_start(HWND hWnd)
 {
     dprintf("slideshow START\n");
 
-    if (g_files.count <= 1) return;
+    if (g_files.paths_count <= 1) return;
 
     g_slide.active = true;
     slideshow_rearm(hWnd);
@@ -739,15 +750,20 @@ static inline void slideshow_toggle(HWND hWnd)
 
 static void slideshow_advance(void)
 {
-    if (g_files.count <= 1) return;
+    if (g_files.paths_count <= 1) return;
 
     // same as a "right" move
-    g_files.current = (g_files.current + 1) % g_files.count;
+    g_files.current = (g_files.current + 1) % g_files.paths_count;
 }
 
 //
 // RENDER
 //
+
+static void image_full_path(uint16_t index, wchar_t *out, size_t out_cap)
+{
+    swprintf_s(out, out_cap, L"%s\\%s", g_files.base_path, g_files.file_names[index]);
+}
 
 static inline void image_reset_view(void)
 {
@@ -759,9 +775,9 @@ static inline void image_reset_view(void)
 
 static uint16_t image_map_index(int offset)
 {
-    if (g_files.count == 0) return 0;
+    if (g_files.paths_count == 0) return 0;
 
-    int count   = (int)g_files.count;
+    int count   = (int)g_files.paths_count;
     int current = (int)g_files.current;
 
     int pos = (current + offset) % count;
@@ -814,7 +830,7 @@ static void image_show_current(void)
         };
 
         // when less images than the cache size
-        int active_targets = (g_files.count < 5) ? g_files.count : 5;
+        int active_targets = (g_files.paths_count < 5) ? g_files.paths_count : 5;
         for (int t = 0; t < active_targets; t++)
         {
             uint16_t target = to_cache[t];
@@ -941,37 +957,34 @@ static int is_ext_supported(const wchar_t *name)
     return 0;
 }
 
-static void scan_directory(const wchar_t *dir, size_t len)
+static void scan_for_images(const wchar_t *dir)
 {
-    dprintf("scan_directory : %ls (%u)\n", dir, len);
+    dprintf("scan_for_images : '%ls'\n", dir);
 
     if (!g_files.data)
         g_files.data = vmalloc(FILES_MAX_COUNT * MAX_PATH * sizeof(wchar_t));
 
-    g_files.count   = 0;
-    g_files.current = 0;
+    g_files.paths_count = 0;
+    g_files.current     = 0;
+    g_files.data_used   = 0;
 
     wchar_t pattern[MAX_PATH] = {0};
     swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
+    dprintf("   pattern : '%ls'\n", pattern);
 
-    WIN32_FIND_DATAW fd;
+    WIN32_FIND_DATAW fd = {0};
     HANDLE           hf = FindFirstFileExW(pattern,
                                            FindExInfoBasic,
                                            &fd,
                                            FindExSearchNameMatch,
                                            NULL,
-                                           0);
-
-    // pattern would look like : "images\4",
-    // dir look like           : "images\4\*",
-    // len + 1 is to include the "\" we just added
-    size_t base_len = len + 1;
-
+                                           FIND_FIRST_EX_LARGE_FETCH);
     if (hf == INVALID_HANDLE_VALUE) return;
 
     do
     {
-        if (g_files.count >= FILES_MAX_COUNT) break;
+        if (g_files.paths_count >= FILES_MAX_COUNT)
+            break;
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             continue;
@@ -979,90 +992,76 @@ static void scan_directory(const wchar_t *dir, size_t len)
         if (!is_ext_supported(fd.cFileName))
             continue;
 
-        size_t file_len  = wcslen(fd.cFileName);
-        size_t total_len = base_len + file_len + 1; // +1 for null terminator
+        size_t file_name_len = wcslen(fd.cFileName) + 1;
 
-        if (total_len > MAX_PATH)
-            continue; // or truncate/log, but don't write past the slot
+        // TODO : check bounds checking for g_files.data
 
-        wchar_t *full                = g_files.data + (g_files.count * MAX_PATH);
-        g_files.paths[g_files.count] = full;
+        wchar_t *file_name_location = g_files.data + g_files.data_used;
+        g_files.data_used += file_name_len;
 
-        // TODO : could we save the base somewhere, then just append the file when loading?
-        wmemcpy(full, pattern, base_len);
-        wmemcpy(full + base_len, fd.cFileName, file_len + 1); // include \0
+        wmemcpy(file_name_location, fd.cFileName, file_name_len);
 
-        g_files.data_used_chars += total_len;
-        g_files.count++;
+        g_files.file_names[g_files.paths_count] = file_name_location;
+        g_files.paths_count++;
 
     } while (FindNextFileW(hf, &fd));
 
     FindClose(hf);
 }
 
+
 static void scan_from_path(const wchar_t *path)
 {
-    // TODO : timing
+    dprintf("scan_from_path : '%ls'\n", path);
 
-    dprintf("scan_from_path : %ls\n", path);
+    double start_time = time_in_ms();
 
-    wchar_t raw[MAX_PATH] = {0};
-    wcscpy_s(raw, MAX_PATH, path);
-
-    // strip trailing quotes and backslashes
-    size_t rlen = wcslen(raw);
-    while (rlen > 0 &&
-           ((raw[rlen - 1] == L'"') || (raw[rlen - 1] == L'\\')))
+    wchar_t *file_name     = NULL;
+    DWORD    full_path_len = GetFullPathNameW(path, MAX_PATH, g_files.base_path, &file_name);
+    if (full_path_len == 0 || full_path_len > MAX_PATH)
     {
-        raw[--rlen] = L'\0';
+        dprintf("   GetFullPathNameW failed\n");
+        return;
+    };
+
+    DWORD attr = GetFileAttributesW(g_files.base_path);
+    if (attr == INVALID_FILE_ATTRIBUTES)
+    {
+        dprintf("   GetFileAttributesW == INVALID_FILE_ATTRIBUTES\n");
+        return;
     }
-
-    // resolve to a full, absolute path so relative CLI args
-    // (e.g. "image_3.png" or "..\images\9\image_3.png") match
-    // the absolute paths returned by FindFirstFileExW later
-    wchar_t full_clean_path[MAX_PATH] = {0};
-    if (!GetFullPathNameW(raw, MAX_PATH, full_clean_path, NULL))
-        return; // couldn't resolve — bad path
-
-    wchar_t dir[MAX_PATH] = {0};
-    wcscpy_s(dir, MAX_PATH, full_clean_path);
-    size_t len = wcslen(dir);
-
-    DWORD attr = GetFileAttributesW(dir);
-    if (attr == INVALID_FILE_ATTRIBUTES) return;
-
     if (attr & FILE_ATTRIBUTE_DIRECTORY)
     {
-        scan_directory(dir, len);
-    }
-    else
-    {
-        wchar_t *sep = wcsrchr(dir, L'\\');
-        if (sep)
-        {
-            *sep = L'\0';
-            len  = wcslen(dir);
-            scan_directory(dir, len);
-        }
-        // sep == NULL should now be unreachable, since
-        // GetFullPathNameW always returns a drive/UNC-rooted path
+        file_name = NULL;
     }
 
-    for (uint16_t i = 0; i < g_files.count; i++)
+    // sets the last '\' as 0 if we have a file name on the end
+    if (file_name != NULL) *(file_name - 1) = L'\0';
+
+    dprintf("   full_path : '%ls'\n", g_files.base_path);
+    dprintf("   file_name : '%ls'\n", file_name);
+    scan_for_images(g_files.base_path);
+
+    if (file_name && is_ext_supported(file_name))
     {
-        if (_wcsicmp(g_files.paths[i], full_clean_path) == 0)
+        for (uint16_t i = 0; i < g_files.paths_count; i++)
         {
-            g_files.current = i;
-            break;
+            if (_wcsicmp(g_files.file_names[i], file_name) == 0)
+            {
+                g_files.current = i;
+                break;
+            }
         }
     }
 
+    double elapsed_time = time_in_ms() - start_time;
+    dprintf("time : %fms\n", elapsed_time);
     if (1)
     {
         dprintf("Loaded images from: '%ls'\n", path);
-        for (uint16_t i = 0; i < g_files.count; i++)
+        for (uint16_t i = 0; i < g_files.paths_count; i++)
         {
-            dprintf("    %ls %s\n", g_files.paths[i], g_files.current == i ? "<--" : "");
+            dprintf("    '%ls' %s\n", g_files.file_names[i], g_files.current == i ? "<--" : "");
         }
     }
 }
@@ -1073,15 +1072,13 @@ static void scan_from_path(const wchar_t *path)
 
 static void window_update_title(HWND hWnd)
 {
-    if (g_files.count == 0)
+    if (g_files.paths_count == 0)
     {
         SetWindowTextW(hWnd, L"Pokaz - no images found");
         return;
     }
 
-    const wchar_t *path = g_files.paths[g_files.current];
-    const wchar_t *name = wcsrchr(path, L'\\');
-    name                = name ? name + 1 : path;
+    const wchar_t *name = g_files.file_names[g_files.current];
 
     uint16_t current_idx = image_map_index(0) + 1;
 
@@ -1090,17 +1087,19 @@ static void window_update_title(HWND hWnd)
     {
         double secs = SLIDESHOW_SPEEDS[g_slide.speed_index] / 1000.0;
 
-        swprintf_s(title, 256, L"[\u25b6 %.1fs] [%d / %d] %s (%d \u00d7 %d)",
+        swprintf_s(title, 256, L"[\u25b6 %.1fs] %s [%d / %d] %s (%d \u00d7 %d)",
                    secs,
-                   g_files.current + 1, g_files.count,
-                   name,
+                   g_shuffle.is_shuffle ? L"[\u21c4] " : L"",
+                   current_idx, g_files.paths_count,
+                   name ? name : "ERROR",
                    g_render.w, g_render.h);
     }
     else
     {
-        swprintf_s(title, 256, L"[%d / %d] %s (%d \u00d7 %d)",
-                   g_files.current + 1, g_files.count,
-                   name,
+        swprintf_s(title, 256, L"%s [%d / %d] %s (%d \u00d7 %d)",
+                   g_shuffle.is_shuffle ? L"[\u21c4] " : L"",
+                   current_idx, g_files.paths_count,
+                   name ? name : "ERROR",
                    g_render.w, g_render.h);
     }
 
@@ -1172,9 +1171,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 case VK_NEXT:
                 case 'D':
                 {
-                    if (g_files.count > 0)
+                    if (g_files.paths_count > 0)
                     {
-                        g_files.current = (g_files.current + 1) % g_files.count;
+                        g_files.current = (g_files.current + 1) % g_files.paths_count;
                         image_show_current();
                         InvalidateRect(hwnd, NULL, FALSE);
                     }
@@ -1184,9 +1183,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 case VK_PRIOR:
                 case 'A':
                 {
-                    if (g_files.count > 0)
+                    if (g_files.paths_count > 0)
                     {
-                        g_files.current = (g_files.current + g_files.count - 1) % g_files.count;
+                        g_files.current = (g_files.current + g_files.paths_count - 1) % g_files.paths_count;
                         image_show_current();
                         InvalidateRect(hwnd, NULL, FALSE);
                     }
@@ -1194,7 +1193,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 }
                 case VK_HOME:
                 {
-                    if (g_files.count > 0)
+                    if (g_files.paths_count > 0)
                     {
                         g_files.current = 0;
                         image_show_current();
@@ -1204,9 +1203,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 }
                 case VK_END:
                 {
-                    if (g_files.count > 0)
+                    if (g_files.paths_count > 0)
                     {
-                        g_files.current = g_files.count - 1;
+                        g_files.current = g_files.paths_count - 1;
                         image_show_current();
                         InvalidateRect(hwnd, NULL, FALSE);
                     }
