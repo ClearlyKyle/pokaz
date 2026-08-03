@@ -700,6 +700,84 @@ static void cache_cleanup(void)
 }
 
 //
+// SHUFFLE
+//
+
+struct shuffle
+{
+    bool      is_shuffle;
+    uint16_t *map;
+};
+
+static struct shuffle g_shuffle = {.is_shuffle = false};
+
+static uint16_t image_map_index(int offset);
+
+static void shuffle_map_generate(uint16_t pin)
+{
+    // NOTE : we regenerate the shuffle map every time we toggle shuffle on,
+    // should this de done only once?
+    if (g_shuffle.map != NULL)
+    {
+        vfree(g_shuffle.map);
+        g_shuffle.map = NULL;
+    }
+
+    if (g_files.paths_count == 0) return;
+
+    g_shuffle.map = vmalloc(g_files.paths_count * sizeof(uint16_t));
+    if (g_shuffle.map == NULL) return; // oom
+
+    for (uint16_t i = 0; i < g_files.paths_count; i++)
+    {
+        g_shuffle.map[i] = i;
+    }
+
+    // if we didnt swap these, when we choose random we would jump to the first random
+    // image but it wont be displayed, as our cache lags behind.
+    // uint16_t current_file_index = image_map_index(0);
+    if (pin < g_files.paths_count)
+    {
+        uint16_t temp      = g_shuffle.map[0];
+        g_shuffle.map[0]   = g_shuffle.map[pin];
+        g_shuffle.map[pin] = temp;
+    }
+
+    static bool is_seeded = false;
+    if (!is_seeded)
+    {
+        srand((unsigned int)time(NULL));
+        is_seeded = true;
+    }
+
+    // Fisher-Yates Shuffle
+    for (uint16_t i = g_files.paths_count - 1; i > 1; i--)
+    {
+        // ensuring we can safely shuffle up to 65535 (uint16_t max) items
+        uint32_t large_rand = ((rand() << 15) | rand());
+
+        // we dont want to move our first element
+        uint16_t j = 1 + (uint16_t)(large_rand % i);
+
+        uint16_t temp    = g_shuffle.map[i];
+        g_shuffle.map[i] = g_shuffle.map[j];
+        g_shuffle.map[j] = temp;
+    }
+
+    g_files.current = 0;
+
+    dprintf("shuffle_map_generate\n");
+#if 1
+    dprintf("[");
+    for (uint16_t i = 0; i < g_files.paths_count; i++)
+    {
+        dprintf("%s%u", (i == 0) ? "" : ", ", g_shuffle.map[i]);
+    }
+    dprintf("]\n");
+#endif
+}
+
+//
 // SLIDESHOW
 //
 
@@ -783,18 +861,20 @@ static uint16_t image_map_index(int offset)
     int pos = (current + offset) % count;
     if (pos < 0) pos += count;
 
+    if (g_shuffle.is_shuffle && g_shuffle.map != NULL)
+    {
+        return g_shuffle.map[pos];
+    }
 
     return (uint16_t)pos;
 }
 
 static void image_show_current(void)
 {
-    if (g_files.count == 0) return;
+    if (g_files.paths_count == 0) return;
 
     image_reset_view();
     uint16_t current_idx = image_map_index(0);
-
-    dprintf("image_show_current : %u\n", current_idx);
 
     BYTE          *pixels_to_upload = NULL;
     pixel_format_t format           = 0;
@@ -1237,6 +1317,29 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     InvalidateRect(hwnd, NULL, FALSE);
                     break;
                 }
+                case 'T':
+                {
+                    if (g_files.paths_count == 0) break;
+
+                    if (!g_shuffle.is_shuffle)
+                    {
+                        uint16_t active_file = image_map_index(0);
+                        g_shuffle.is_shuffle = true; // must be toggled AFTER image_map_index
+
+                        shuffle_map_generate(active_file);
+                    }
+                    else
+                    {
+                        uint16_t active_file = image_map_index(0);
+                        g_files.current      = active_file;
+                        g_shuffle.is_shuffle = false; // must be toggled AFTER image_map_index
+                    }
+
+                    image_show_current();
+                    window_update_title(hwnd);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                }
                 case VK_SPACE:
                 {
                     slideshow_toggle(hwnd);
@@ -1489,6 +1592,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     UnregisterClassW(class_name, hInstance);
 
     if (g_files.data) vfree(g_files.data);
+    if (g_shuffle.map) vfree(g_shuffle.map);
     if (g_tj_handle) tjDestroy(g_tj_handle);
 
     return (int)msg.wParam;
