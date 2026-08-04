@@ -138,6 +138,19 @@ static inline double time_in_ms(void)
 // MEMORY
 //
 
+static size_t system_get_page_size(void)
+{
+    SYSTEM_INFO sys_info = {0};
+    GetSystemInfo(&sys_info);
+    return sys_info.dwPageSize;
+}
+
+static inline size_t block_align_to_page(size_t size)
+{
+    size_t page_size = system_get_page_size();
+    return (size + (page_size - 1)) & ~(page_size - 1);
+}
+
 static inline void *vmalloc(size_t size)
 {
     return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -146,6 +159,69 @@ static inline void *vmalloc(size_t size)
 static inline void vfree(void *ptr)
 {
     VirtualFree(ptr, 0, MEM_RELEASE);
+}
+
+struct mem_block
+{
+    unsigned char *base;
+    size_t         max_capacity;
+    size_t         committed; // committed physical RAM
+};
+
+static struct mem_block block_init(size_t max_capacity)
+{
+    struct mem_block block = {0};
+
+    block.base = (unsigned char *)VirtualAlloc(
+        NULL,
+        max_capacity,
+        MEM_RESERVE,
+        PAGE_NOACCESS // access prohibited until explicitly committed
+    );
+    block.max_capacity = (block.base != NULL) ? max_capacity : 0;
+    block.committed    = 0;
+
+    return block;
+}
+
+static void *block_commit(struct mem_block *block, size_t needed_size)
+{
+    if (!block || !block->base) return NULL;
+
+    if (needed_size <= block->committed) return block->base;
+
+    if (needed_size > block->max_capacity)
+    {
+        dprintf("block_commit : requested (%zu B) exceeds max (%zu B)\n", needed_size, block->max_capacity);
+        return NULL;
+    }
+
+    size_t target_commit    = block_align_to_page(needed_size);
+    size_t additional_bytes = target_commit - block->committed;
+
+    dprintf("block : %p needs resize\n", (void *)block->base);
+
+    void *result = VirtualAlloc(
+        block->base + block->committed,
+        additional_bytes,
+        MEM_COMMIT,
+        PAGE_READWRITE);
+
+    if (!result) return NULL;
+
+    block->committed = target_commit;
+    return block->base;
+}
+
+void block_free(struct mem_block *block)
+{
+    if (block && block->base)
+    {
+        VirtualFree(block->base, 0, MEM_RELEASE);
+        block->base         = NULL;
+        block->max_capacity = 0;
+        block->committed    = 0;
+    }
 }
 
 //
@@ -301,9 +377,9 @@ static void wic_cleanup(void)
     CoUninitialize();
 }
 
-static bool wic_decode(const wchar_t *path, BYTE *out_buf, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
+static bool wic_decode(struct mem_block *block, const wchar_t *path, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
 {
-    if (!path || !out_buf || !out_w || !out_h) return false;
+    if (!block || !path || !out_w || !out_h || !out_format) return false;
 
     IWICBitmapDecoder     *decoder = NULL;
     IWICBitmapFrameDecode *frame   = NULL;
@@ -332,10 +408,13 @@ static bool wic_decode(const wchar_t *path, BYTE *out_buf, UINT *out_w, UINT *ou
 
     IWICFormatConverter_GetSize(conv, out_w, out_h);
 
+    void *pixels = block_commit(block, (size_t)((*out_w) * (*out_h) * 4));
+    if (!pixels) goto done;
+
     hr = IWICFormatConverter_CopyPixels(conv, NULL,
                                         (*out_w) * 4,
                                         (*out_w) * (*out_h) * 4,
-                                        out_buf);
+                                        pixels);
     if (FAILED(hr)) goto done;
 
     *out_format = PIXEL_FORMAT_BGRA8;
@@ -361,9 +440,9 @@ done:
 
 static tjhandle g_tj_handle = NULL;
 
-static bool turbojpeg_decode(tjhandle handle, const wchar_t *path, BYTE *buf, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
+static bool turbojpeg_decode(struct mem_block *block, tjhandle handle, const wchar_t *path, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
 {
-    if (!path || !buf || !out_w || !out_h) return false;
+    if (!block || !handle || !path || !out_w || !out_h || !out_format) return false;
 
     BYTE  *file_buf = NULL;
     bool   result   = false;
@@ -393,8 +472,11 @@ static bool turbojpeg_decode(tjhandle handle, const wchar_t *path, BYTE *buf, UI
     if (tjDecompressHeader3(handle, file_buf, (unsigned long)bytes_read,
                             &w, &h, &subsamp, &colour_space) < 0) goto done;
 
+    void *pixels = block_commit(block, (size_t)w * h * tjPixelSize[TJPF_BGRA]);
+    if (!pixels) goto done;
+
     if (tjDecompress2(handle, file_buf, (unsigned long)bytes_read,
-                      buf, w, 0, h, TJPF_BGRA, TJFLAG_FASTDCT) < 0) goto done;
+                      pixels, w, 0, h, TJPF_BGRA, TJFLAG_FASTDCT) < 0) goto done;
 
     *out_w      = (UINT)w;
     *out_h      = (UINT)h;
@@ -431,9 +513,9 @@ done:
 // SPNG
 //
 
-static bool decode_png_spng(const wchar_t *path, BYTE **out_buf, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
+static bool decode_png_spng(struct mem_block *block, const wchar_t *path, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
 {
-    if (!path || !out_buf || !out_w || !out_h) return false;
+    if (!block || !path || !out_w || !out_h || !out_format) return false;
 
     BYTE     *file_buf = NULL;
     spng_ctx *ctx      = NULL;
@@ -475,7 +557,12 @@ static bool decode_png_spng(const wchar_t *path, BYTE **out_buf, UINT *out_w, UI
     size_t out_size = 0;
     if (spng_decoded_image_size(ctx, fmt, &out_size) != 0) goto done;
 
-    if (spng_decode_image(ctx, *out_buf, out_size, fmt, 0) != 0) goto done;
+#ifndef IMAGES_PREALLOC
+    void *pixels = block_commit(block, out_size);
+    if (!pixels) goto done;
+#endif
+
+    if (spng_decode_image(ctx, pixels, out_size, fmt, 0) != 0) goto done;
 
     *out_w = (UINT)ihdr.width;
     *out_h = (UINT)ihdr.height;
@@ -513,7 +600,7 @@ done:
 // DECODE
 //
 
-static bool decode_image(tjhandle tj_handle, const wchar_t *path, BYTE *buf, UINT *w, UINT *h, pixel_format_t *out_format)
+static bool decode_image(struct mem_block *block, tjhandle tj_handle, const wchar_t *path, UINT *w, UINT *h, pixel_format_t *out_format)
 {
     bool result = false;
 
@@ -524,11 +611,15 @@ static bool decode_image(tjhandle tj_handle, const wchar_t *path, BYTE *buf, UIN
     {
         if (_wcsicmp(ext, L".jpg") == 0 || _wcsicmp(ext, L".jpeg") == 0)
         {
-            result = turbojpeg_decode(tj_handle, path, buf, w, h, out_format);
+            result = turbojpeg_decode(block, tj_handle, path, w, h, out_format);
+        }
+        else if (_wcsicmp(ext, L".png") == 0)
+        {
+            result = decode_png_spng(block, path, w, h, out_format);
         }
 
         // try again / defualt with wic
-        if (!result) result = wic_decode(path, buf, w, h, out_format);
+        if (!result) result = wic_decode(block, path, w, h, out_format);
     }
     else
     {
@@ -565,8 +656,11 @@ struct cache_entry
     enum cache_state state;
 
     pixel_format_t format;
-    BYTE          *pixels;
-    UINT           w, h;
+
+    struct mem_block block;
+    void            *pixels; // TODO : remove?
+
+    UINT w, h;
 };
 
 struct image_cache
@@ -616,8 +710,9 @@ static DWORD WINAPI background_prefetch_thread(LPVOID arg)
 
         if (0) dprintf("thread %u decoding %u, '%ls'\n", thread_id, target, full_path);
 
-        bool res = decode_image(tj_handle, full_path,
-                                g_cache.entries[i].pixels,
+        bool res = decode_image(&g_cache.entries[i].block,
+                                tj_handle,
+                                full_path,
                                 &g_cache.entries[i].w,
                                 &g_cache.entries[i].h,
                                 &g_cache.entries[i].format);
@@ -638,6 +733,7 @@ static DWORD WINAPI background_prefetch_thread(LPVOID arg)
 
     return 0;
 }
+
 static void cache_reset(void)
 {
     EnterCriticalSection(&g_cache.lock);
@@ -648,7 +744,13 @@ static void cache_reset(void)
         g_cache.entries[i].state = CACHE_EMPTY;
 
         if (!g_cache.entries[i].pixels)
-            g_cache.entries[i].pixels = vmalloc(IMAGE_PREALLOC_SIZE);
+        {
+            g_cache.entries[i].block = block_init(IMAGE_PREALLOC_SIZE);
+
+            // TODO : should we commit right away?
+            g_cache.entries[i].pixels = g_cache.entries[i].block.base;
+        }
+        // TODO : we would release the block back to the OS again here
     }
 
     LeaveCriticalSection(&g_cache.lock);
@@ -690,10 +792,7 @@ static void cache_cleanup(void)
 
     for (uint16_t i = 0; i < CACHE_CAPACITY; i++)
     {
-        if (g_cache.entries[i].pixels)
-        {
-            vfree(g_cache.entries[i].pixels);
-        }
+        block_free(&g_cache.entries[i].block);
     }
 
     DeleteCriticalSection(&g_cache.lock);
@@ -1136,7 +1235,7 @@ static void scan_from_path(const wchar_t *path)
 
     double elapsed_time = time_in_ms() - start_time;
     dprintf("time : %fms\n", elapsed_time);
-    if (1)
+    if (0)
     {
         dprintf("Loaded images from: '%ls'\n", path);
         for (uint16_t i = 0; i < g_files.paths_count; i++)
@@ -1171,7 +1270,7 @@ static void window_update_title(HWND hWnd)
                    secs,
                    g_shuffle.is_shuffle ? L"[\u21c4] " : L"",
                    current_idx, g_files.paths_count,
-                   name ? name : "ERROR",
+                   name,
                    g_render.w, g_render.h);
     }
     else
@@ -1179,23 +1278,23 @@ static void window_update_title(HWND hWnd)
         swprintf_s(title, 256, L"%s [%d / %d] %s (%d \u00d7 %d)",
                    g_shuffle.is_shuffle ? L"[\u21c4] " : L"",
                    current_idx, g_files.paths_count,
-                   name ? name : "ERROR",
+                   name,
                    g_render.w, g_render.h);
     }
 
 #if 1
-    wchar_t cache_state[64] = {0};
+    wchar_t cache_mem_state[128] = {0};
     EnterCriticalSection(&g_cache.lock);
-    swprintf_s(cache_state, 64, L"[%u, %u, %u, %u, %u]",
-               g_cache.entries[0].index,
-               g_cache.entries[1].index,
-               g_cache.entries[2].index,
-               g_cache.entries[3].index,
-               g_cache.entries[4].index);
+    swprintf_s(cache_mem_state, 128, L"[(%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB]",
+               g_cache.entries[0].index, g_cache.entries[0].block.committed / 1024.0 / 1024.0,
+               g_cache.entries[1].index, g_cache.entries[1].block.committed / 1024.0 / 1024.0,
+               g_cache.entries[2].index, g_cache.entries[2].block.committed / 1024.0 / 1024.0,
+               g_cache.entries[3].index, g_cache.entries[3].block.committed / 1024.0 / 1024.0,
+               g_cache.entries[4].index, g_cache.entries[4].block.committed / 1024.0 / 1024.0);
     LeaveCriticalSection(&g_cache.lock);
 
-    wchar_t full[256] = {0};
-    swprintf_s(full, 256, L"%s %s", cache_state, title);
+    wchar_t full[512] = {0};
+    swprintf_s(full, 512, L"%s %s", cache_mem_state, title);
     SetWindowTextW(hWnd, full);
 #else
     SetWindowTextW(hWnd, title);
