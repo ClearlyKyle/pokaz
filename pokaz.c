@@ -1116,6 +1116,18 @@ static void image_show_current(void)
         ReleaseSemaphore(g_cache.semaphore, 1, NULL);
     }
 }
+
+static float image_compute_scale(void)
+{
+    int is_sideways = (g_main_image.rotation % 180 != 0);
+    int fit_w       = is_sideways ? g_main_image.h : g_main_image.w;
+    int fit_h       = is_sideways ? g_main_image.w : g_main_image.h;
+
+    float sx  = (float)g_win_w / (float)fit_w;
+    float sy  = (float)g_win_h / (float)fit_h;
+    float fit = (sx < sy) ? sx : sy;
+
+    return fit * powf(1.15f, g_main_image.zoom);
 }
 
 static void image_render(void)
@@ -1123,22 +1135,20 @@ static void image_render(void)
     glViewport(0, 0, g_win_w, g_win_h);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    if (!g_render.tex || g_files.count == 0) return;
+    GLuint tex_to_draw = g_main_image.tex;
+    float  img_w       = (float)g_main_image.w;
+    float  img_h       = (float)g_main_image.h;
 
-    int is_sideways = (g_render.rotation % 180 != 0);
-    int fit_w       = is_sideways ? g_render.h : g_render.w;
-    int fit_h       = is_sideways ? g_render.w : g_render.h;
+    float scale    = image_compute_scale();
+    float pan_x    = g_main_image.pan_x;
+    float pan_y    = g_main_image.pan_y;
+    float rotation = (float)g_main_image.rotation;
 
-    float sx    = (float)g_win_w / (float)fit_w;
-    float sy    = (float)g_win_h / (float)fit_h;
-    float fit   = (sx < sy) ? sx : sy;
-    float scale = fit * powf(1.15f, g_render.zoom);
+    float dw = img_w * scale;
+    float dh = img_h * scale;
 
-    float dw = g_render.w * scale;
-    float dh = g_render.h * scale;
-
-    float cx = g_win_w * 0.5f + g_render.pan_x;
-    float cy = g_win_h * 0.5f + g_render.pan_y;
+    float cx = g_win_w * 0.5f + pan_x;
+    float cy = g_win_h * 0.5f + pan_y;
 
     float x0 = cx - dw * 0.5f, y0 = cy - dh * 0.5f;
     float x1 = cx + dw * 0.5f, y1 = cy + dh * 0.5f;
@@ -1146,33 +1156,39 @@ static void image_render(void)
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glOrtho(0, g_win_w, g_win_h, 0, -1, 1);
+
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
-    // Rotate unrotated quad around center
-    glTranslatef(cx, cy, 0.0f);
-    glRotatef((float)g_render.rotation, 0.0f, 0.0f, 1.0f);
-    glTranslatef(-cx, -cy, 0.0f);
+    if (rotation != 0.0f)
+    {
+        glTranslatef(cx, cy, 0.0f);
+        glRotatef(rotation, 0.0f, 0.0f, 1.0f);
+        glTranslatef(-cx, -cy, 0.0f);
+    }
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, g_render.tex);
+    glBindTexture(GL_TEXTURE_2D, tex_to_draw);
     glColor4f(1, 1, 1, 1);
+
     glBegin(GL_QUADS);
     {
         glTexCoord2f(0.0f, 0.0f);
         glVertex2f(x0, y0);
-
         glTexCoord2f(1.0f, 0.0f);
         glVertex2f(x1, y0);
-
         glTexCoord2f(1.0f, 1.0f);
         glVertex2f(x1, y1);
-
         glTexCoord2f(0.0f, 1.0f);
         glVertex2f(x0, y1);
     }
     glEnd();
+
     glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND); // Turn it back off when done
 }
 
 //
@@ -1203,11 +1219,9 @@ static void scan_for_images(const wchar_t *dir)
 
     g_files.paths_count = 0;
     g_files.current     = 0;
-    g_files.data_used   = 0;
 
     wchar_t pattern[MAX_PATH] = {0};
     swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
-    dprintf("   pattern : '%ls'\n", pattern);
 
     WIN32_FIND_DATAW fd = {0};
     HANDLE           hf = FindFirstFileExW(pattern,
@@ -1571,9 +1585,20 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             POINT lpPoint = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             BOOL  res     = ScreenToClient(hwnd, &lpPoint);
 
-            if (res)
+            if (res && g_main_image.w != 0 && g_main_image.h != 0)
             {
-                g_render.zoom += (delta > 0) ? 1.0f : -1.0f;
+                float old_scale = image_compute_scale();
+                float cx        = g_win_w * 0.5f + g_main_image.pan_x;
+                float cy        = g_win_h * 0.5f + g_main_image.pan_y;
+
+                g_main_image.zoom += (delta > 0) ? 1.0f : -1.0f;
+
+                float new_scale = image_compute_scale();
+                float ratio     = new_scale / old_scale;
+
+                g_main_image.pan_x += (lpPoint.x - cx) * (1.0f - ratio);
+                g_main_image.pan_y += (lpPoint.y - cy) * (1.0f - ratio);
+
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;
