@@ -19,8 +19,7 @@
 #include "deps/spng.h"
 #include "deps/miniz.h"
 
-#define LIBJPEG_TURBO_STATIC
-#include <turbojpeg.h>
+#include "turbojpeg.h"
 #pragma comment(lib, "turbojpeg-static")
 
 #pragma comment(lib, "user32")
@@ -55,45 +54,6 @@ static const wchar_t *SUPPORTED_EXTENSIONS[] = {
     L".jpg", L".jpeg", L".png", L".bmp", L".gif",
     L".tiff", L".tif", L".ico", L".webp", L".wdp",
     L".hdp", L".jxr"};
-
-//
-// STATE
-//
-
-struct file_list
-{
-    wchar_t *data;
-    size_t   data_used;
-
-    wchar_t  base_path[MAX_PATH];         // C:/folder/images/
-    wchar_t *file_names[FILES_MAX_COUNT]; // image1.jpg, image2.jpg...
-
-    uint16_t paths_count;
-    uint16_t current;
-};
-
-// TODO : better naming this
-struct render_state
-{
-    GLuint tex;
-    int    w, h;
-
-    int   rotation;
-    float zoom;
-
-    int   drag_start_x, drag_start_y;
-    float pan_start_x, pan_start_y;
-    float pan_x, pan_y;
-    bool  dragging;
-};
-
-static int g_win_w = WINDOW_START_W;
-static int g_win_h = WINDOW_START_H;
-
-static struct file_list    g_files  = {0};
-static struct render_state g_render = {0};
-
-static void image_full_path(uint16_t index, wchar_t *out, size_t out_cap);
 
 //
 // DEBUG
@@ -138,6 +98,10 @@ static inline double time_in_ms(void)
 // MEMORY
 //
 
+#define KB(x) ((size_t)((double)(x) * 1024.0))
+#define MB(x) ((size_t)((double)(x) * 1024.0 * 1024.0))
+#define GB(x) ((size_t)((double)(x) * 1024.0 * 1024.0 * 1024.0))
+
 static size_t system_get_page_size(void)
 {
     SYSTEM_INFO sys_info = {0};
@@ -145,36 +109,107 @@ static size_t system_get_page_size(void)
     return sys_info.dwPageSize;
 }
 
-static inline size_t block_align_to_page(size_t size)
+static inline size_t align_forward(size_t ptr, size_t align)
+{
+    assert((align & (align - 1)) == 0 && "alignment must be a power of 2");
+    return (ptr + (align - 1)) & ~(align - 1);
+}
+
+static inline size_t align_to_page(size_t size)
 {
     size_t page_size = system_get_page_size();
-    return (size + (page_size - 1)) & ~(page_size - 1);
+    return align_forward(size, page_size);
 }
 
-static inline void *vmalloc(size_t size)
+//
+// ARENA
+//
+
+struct arena
 {
-    return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    uint8_t *base;
+    size_t   capacity;
+    size_t   committed;
+    size_t   used;
+};
+
+static bool arena_init(struct arena *arena, size_t reserve_bytes)
+{
+    if (!arena) return false;
+
+    arena->base = VirtualAlloc(
+        NULL,
+        reserve_bytes,
+        MEM_RESERVE,
+        PAGE_NOACCESS // access prohibited until explicitly committed
+    );
+    if (!arena->base) return false;
+
+    arena->capacity  = reserve_bytes;
+    arena->committed = 0;
+    arena->used      = 0;
+
+    return true;
 }
 
-static inline void vfree(void *ptr)
+static void *arena_alloc(struct arena *arena, size_t size)
 {
-    VirtualFree(ptr, 0, MEM_RELEASE);
+    size_t align          = sizeof(void *);
+    size_t aligned_offset = align_forward(arena->used, align);
+
+    size_t total_size = aligned_offset + size;
+
+    if (total_size > arena->capacity) return NULL;
+
+    if (total_size > arena->committed)
+    {
+        size_t bytes_needed = total_size - arena->committed;
+        size_t commit_size  = align_to_page(bytes_needed);
+
+        void *commit_result = VirtualAlloc(
+            (uint8_t *)arena->base + arena->committed,
+            commit_size,
+            MEM_COMMIT,
+            PAGE_READWRITE);
+
+        if (!commit_result) return NULL;
+        arena->committed += commit_size;
+    }
+
+    void *ptr   = (uint8_t *)arena->base + aligned_offset;
+    arena->used = total_size;
+
+    return ptr;
+}
+
+static void arena_free(struct arena *arena)
+{
+    if (arena && arena->base)
+    {
+        VirtualFree(arena->base, 0, MEM_RELEASE);
+        arena->base      = NULL;
+        arena->capacity  = 0;
+        arena->committed = 0;
+        arena->used      = 0;
+    }
 }
 
 struct mem_block
 {
-    unsigned char *base;
-    size_t         max_capacity;
-    size_t         committed; // committed physical RAM
+    uint8_t *base;
+    size_t   max_capacity;
+    size_t   committed;
 };
 
 static struct mem_block block_init(size_t max_capacity)
 {
     struct mem_block block = {0};
 
-    block.base = (unsigned char *)VirtualAlloc(
+    size_t reserve_size = align_to_page(max_capacity);
+
+    block.base = VirtualAlloc(
         NULL,
-        max_capacity,
+        reserve_size,
         MEM_RESERVE,
         PAGE_NOACCESS // access prohibited until explicitly committed
     );
@@ -189,20 +224,17 @@ static void *block_commit(struct mem_block *block, size_t needed_size)
     if (!block || !block->base) return NULL;
 
     if (needed_size <= block->committed) return block->base;
-
     if (needed_size > block->max_capacity)
     {
         dprintf("block_commit : requested (%zu B) exceeds max (%zu B)\n", needed_size, block->max_capacity);
         return NULL;
     }
 
-    size_t target_commit    = block_align_to_page(needed_size);
+    size_t target_commit    = align_to_page(needed_size);
     size_t additional_bytes = target_commit - block->committed;
 
-    dprintf("block : %p needs resize\n", (void *)block->base);
-
     void *result = VirtualAlloc(
-        block->base + block->committed,
+        (uint8_t *)block->base + block->committed,
         additional_bytes,
         MEM_COMMIT,
         PAGE_READWRITE);
@@ -225,6 +257,44 @@ void block_free(struct mem_block *block)
 }
 
 //
+// STATE
+//
+
+struct file_list
+{
+    struct arena arena;
+
+    wchar_t  base_path[MAX_PATH];         // C:/folder/images/
+    wchar_t *file_names[FILES_MAX_COUNT]; // image1.jpg, image2.jpg...
+
+    uint16_t paths_count;
+    uint16_t current;
+};
+
+struct main_image
+{
+    GLuint tex;
+    int    w, h;
+
+    int   rotation;
+    float zoom;
+
+    int   drag_start_x, drag_start_y;
+    float pan_start_x, pan_start_y;
+    float pan_x, pan_y;
+    bool  dragging;
+};
+
+static int g_win_w = WINDOW_START_W;
+static int g_win_h = WINDOW_START_H;
+
+static struct file_list  g_files      = {0};
+static struct main_image g_main_image = {0};
+
+static void     image_full_path(uint16_t index, wchar_t *out, size_t out_cap);
+static uint16_t image_map_index(int offset);
+
+//
 // OPENGL
 //
 
@@ -235,6 +305,13 @@ void block_free(struct mem_block *block)
 #ifndef GL_BGRA
 #define GL_BGRA (0x80E1)
 #endif
+
+enum pixel_format
+{
+    PIXEL_FORMAT_RGB8,  // 3 bytes/px: R,G,B
+    PIXEL_FORMAT_RGBA8, // 4 bytes/px: R,G,B,A
+    PIXEL_FORMAT_BGRA8, // 4 bytes/px: B,G,R,A
+};
 
 struct gl_context
 {
@@ -278,10 +355,10 @@ static inline bool opengl_init(HWND hwnd)
 
 static void opengl_cleanup(HWND hwnd)
 {
-    if (g_render.tex != 0)
+    if (g_main_image.tex != 0)
     {
-        glDeleteTextures(1, &g_render.tex);
-        g_render.tex = 0;
+        glDeleteTextures(1, &g_main_image.tex);
+        g_main_image.tex = 0;
     }
 
     if (g_gl.hglrc)
@@ -298,14 +375,7 @@ static void opengl_cleanup(HWND hwnd)
     }
 }
 
-typedef enum
-{
-    PIXEL_FORMAT_RGB8,  // 3 bytes/px: R,G,B
-    PIXEL_FORMAT_RGBA8, // 4 bytes/px: R,G,B,A
-    PIXEL_FORMAT_BGRA8, // 4 bytes/px: B,G,R,A
-} pixel_format_t;
-
-static GLuint opengl_texture_upload(BYTE *buf, UINT w, UINT h, pixel_format_t format)
+static GLuint opengl_texture_upload(BYTE *buf, UINT w, UINT h, enum pixel_format format)
 {
     GLenum gl_format       = GL_RGBA;
     GLenum internal_format = GL_RGBA8;
@@ -338,13 +408,9 @@ static GLuint opengl_texture_upload(BYTE *buf, UINT w, UINT h, pixel_format_t fo
 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA, w, h, 0, GL_BGRA, GL_UNSIGNED_BYTE, buf);
+    glTexImage2D(GL_TEXTURE_2D, 0, internal_format, w, h, 0, gl_format, GL_UNSIGNED_BYTE, buf);
     glBindTexture(GL_TEXTURE_2D, 0);
-
-    // dprintf("texture_upload : alloc + upload : %.3fms\n", time);
 
     return tex;
 }
@@ -655,12 +721,9 @@ struct cache_entry
     uint16_t         index;
     enum cache_state state;
 
-    pixel_format_t format;
-
-    struct mem_block block;
-    void            *pixels; // TODO : remove?
-
-    UINT w, h;
+    enum pixel_format format;
+    struct mem_block  block;
+    UINT              w, h;
 };
 
 struct image_cache
@@ -743,14 +806,11 @@ static void cache_reset(void)
         g_cache.entries[i].index = (uint16_t)-1;
         g_cache.entries[i].state = CACHE_EMPTY;
 
-        if (!g_cache.entries[i].pixels)
+        if (!g_cache.entries[i].block.base)
         {
             g_cache.entries[i].block = block_init(IMAGE_PREALLOC_SIZE);
-
-            // TODO : should we commit right away?
-            g_cache.entries[i].pixels = g_cache.entries[i].block.base;
         }
-        // TODO : we would release the block back to the OS again here
+        // NOTE : we would release the block back to the OS again here
     }
 
     LeaveCriticalSection(&g_cache.lock);
@@ -804,28 +864,25 @@ static void cache_cleanup(void)
 
 struct shuffle
 {
-    bool      is_shuffle;
-    uint16_t *map;
+    uint16_t        *map;
+    struct mem_block memory;
+
+    bool is_shuffle;
 };
 
 static struct shuffle g_shuffle = {.is_shuffle = false};
 
-static uint16_t image_map_index(int offset);
-
 static void shuffle_map_generate(uint16_t pin)
 {
-    // NOTE : we regenerate the shuffle map every time we toggle shuffle on,
-    // should this de done only once?
-    if (g_shuffle.map != NULL)
+    if (!g_shuffle.map)
     {
-        vfree(g_shuffle.map);
-        g_shuffle.map = NULL;
+        g_shuffle.memory = block_init(sizeof(uint16_t) * FILES_MAX_COUNT);
     }
 
     if (g_files.paths_count == 0) return;
 
-    g_shuffle.map = vmalloc(g_files.paths_count * sizeof(uint16_t));
-    if (g_shuffle.map == NULL) return; // oom
+    g_shuffle.map = block_commit(&g_shuffle.memory, sizeof(uint16_t) * g_files.paths_count);
+    if (!g_shuffle.map) return;
 
     for (uint16_t i = 0; i < g_files.paths_count; i++)
     {
@@ -865,8 +922,8 @@ static void shuffle_map_generate(uint16_t pin)
 
     g_files.current = 0;
 
+#if DEBUG
     dprintf("shuffle_map_generate\n");
-#if 1
     dprintf("[");
     for (uint16_t i = 0; i < g_files.paths_count; i++)
     {
@@ -944,10 +1001,10 @@ static void image_full_path(uint16_t index, wchar_t *out, size_t out_cap)
 
 static inline void image_reset_view(void)
 {
-    g_render.zoom     = 0.0f;
-    g_render.pan_x    = 0.0f;
-    g_render.pan_y    = 0.0f;
-    g_render.rotation = 0;
+    g_main_image.zoom     = 0.0f;
+    g_main_image.pan_x    = 0.0f;
+    g_main_image.pan_y    = 0.0f;
+    g_main_image.rotation = 0;
 }
 
 static uint16_t image_map_index(int offset)
@@ -975,10 +1032,10 @@ static void image_show_current(void)
     image_reset_view();
     uint16_t current_idx = image_map_index(0);
 
-    BYTE          *pixels_to_upload = NULL;
-    pixel_format_t format           = 0;
-    UINT           w = 0, h = 0;
-    bool           cache_hit = false;
+    BYTE             *pixels_to_upload = NULL;
+    enum pixel_format format           = 0;
+    UINT              w = 0, h = 0;
+    bool              cache_hit = false;
 
     EnterCriticalSection(&g_cache.lock);
     {
@@ -987,7 +1044,7 @@ static void image_show_current(void)
             if (g_cache.entries[j].index == current_idx &&
                 g_cache.entries[j].state == CACHE_READY)
             {
-                pixels_to_upload = g_cache.entries[j].pixels;
+                pixels_to_upload = g_cache.entries[j].block.base;
                 w                = g_cache.entries[j].w;
                 h                = g_cache.entries[j].h;
                 format           = g_cache.entries[j].format;
@@ -1026,7 +1083,7 @@ static void image_show_current(void)
             }
             if (already_cached) continue;
 
-            // Find a slot whose index is NOT in to_cache[] - safe to evict
+            // find a slot whose index is NOT in to_cache[] - safe to evict
             for (uint16_t j = 0; j < CACHE_CAPACITY; j++)
             {
                 uint16_t cached_idx = g_cache.entries[j].index;
@@ -1049,11 +1106,10 @@ static void image_show_current(void)
 
     if (cache_hit)
     {
-        // dprintf("image_show_current : cache hit!\n");
-        if (g_render.tex != 0) glDeleteTextures(1, &g_render.tex);
-        g_render.tex = opengl_texture_upload(pixels_to_upload, w, h, format);
-        g_render.w   = w;
-        g_render.h   = h;
+        if (g_main_image.tex != 0) glDeleteTextures(1, &g_main_image.tex);
+        g_main_image.tex = opengl_texture_upload(pixels_to_upload, w, h, format);
+        g_main_image.w   = w;
+        g_main_image.h   = h;
     }
     else
     {
@@ -1140,8 +1196,10 @@ static void scan_for_images(const wchar_t *dir)
 {
     dprintf("scan_for_images : '%ls'\n", dir);
 
-    if (!g_files.data)
-        g_files.data = vmalloc(FILES_MAX_COUNT * MAX_PATH * sizeof(wchar_t));
+    if (!g_files.arena.base)
+    {
+        if (!arena_init(&g_files.arena, MB(64))) return;
+    }
 
     g_files.paths_count = 0;
     g_files.current     = 0;
@@ -1171,23 +1229,21 @@ static void scan_for_images(const wchar_t *dir)
         if (!is_ext_supported(fd.cFileName))
             continue;
 
-        size_t file_name_len = wcslen(fd.cFileName) + 1;
+        size_t file_name_len = wcslen(fd.cFileName);
 
-        // TODO : check bounds checking for g_files.data
+        wchar_t *file_name_location = arena_alloc(&g_files.arena, file_name_len * sizeof(wchar_t));
+        if (file_name_location)
+        {
+            wmemcpy(file_name_location, fd.cFileName, file_name_len);
 
-        wchar_t *file_name_location = g_files.data + g_files.data_used;
-        g_files.data_used += file_name_len;
-
-        wmemcpy(file_name_location, fd.cFileName, file_name_len);
-
-        g_files.file_names[g_files.paths_count] = file_name_location;
-        g_files.paths_count++;
+            g_files.file_names[g_files.paths_count] = file_name_location;
+            g_files.paths_count++;
+        }
 
     } while (FindNextFileW(hf, &fd));
 
     FindClose(hf);
 }
-
 
 static void scan_from_path(const wchar_t *path)
 {
@@ -1217,8 +1273,6 @@ static void scan_from_path(const wchar_t *path)
     // sets the last '\' as 0 if we have a file name on the end
     if (file_name != NULL) *(file_name - 1) = L'\0';
 
-    dprintf("   full_path : '%ls'\n", g_files.base_path);
-    dprintf("   file_name : '%ls'\n", file_name);
     scan_for_images(g_files.base_path);
 
     if (file_name && is_ext_supported(file_name))
@@ -1234,7 +1288,7 @@ static void scan_from_path(const wchar_t *path)
     }
 
     double elapsed_time = time_in_ms() - start_time;
-    dprintf("time : %fms\n", elapsed_time);
+    dprintf("scan_from_path time : %fms\n", elapsed_time);
     if (0)
     {
         dprintf("Loaded images from: '%ls'\n", path);
@@ -1271,7 +1325,7 @@ static void window_update_title(HWND hWnd)
                    g_shuffle.is_shuffle ? L"[\u21c4] " : L"",
                    current_idx, g_files.paths_count,
                    name,
-                   g_render.w, g_render.h);
+                   g_main_image.w, g_main_image.h);
     }
     else
     {
@@ -1279,13 +1333,13 @@ static void window_update_title(HWND hWnd)
                    g_shuffle.is_shuffle ? L"[\u21c4] " : L"",
                    current_idx, g_files.paths_count,
                    name,
-                   g_render.w, g_render.h);
+                   g_main_image.w, g_main_image.h);
     }
 
-#if 1
-    wchar_t cache_mem_state[128] = {0};
+#if DEBUG
+    wchar_t cache_mem_state[256] = {0};
     EnterCriticalSection(&g_cache.lock);
-    swprintf_s(cache_mem_state, 128, L"[(%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB]",
+    swprintf_s(cache_mem_state, 256, L"[(%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB]",
                g_cache.entries[0].index, g_cache.entries[0].block.committed / 1024.0 / 1024.0,
                g_cache.entries[1].index, g_cache.entries[1].block.committed / 1024.0 / 1024.0,
                g_cache.entries[2].index, g_cache.entries[2].block.committed / 1024.0 / 1024.0,
@@ -1314,12 +1368,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             uint16_t current_index = image_map_index(0);
             if (entry->index == current_index)
             {
-                dprintf("WM_DECODED_IMAGE_READY %d\n", entry->index);
-
-                if (g_render.tex != 0) glDeleteTextures(1, &g_render.tex);
-                g_render.tex = opengl_texture_upload(entry->pixels, entry->w, entry->h, entry->format);
-                g_render.w   = entry->w;
-                g_render.h   = entry->h;
+                if (g_main_image.tex != 0) glDeleteTextures(1, &g_main_image.tex);
+                g_main_image.tex = opengl_texture_upload(entry->block.base, entry->w, entry->h, entry->format);
+                g_main_image.w   = entry->w;
+                g_main_image.h   = entry->h;
 
                 InvalidateRect(hwnd, NULL, FALSE);
             }
@@ -1392,21 +1444,21 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 }
                 case 'R':
                 {
-                    g_render.rotation = (g_render.rotation + 90) % 360;
+                    g_main_image.rotation = (g_main_image.rotation + 90) % 360;
                     InvalidateRect(hwnd, NULL, FALSE);
                     break;
                 }
                 case 'Z':
                 {
                     // TODO : zoom limits
-                    g_render.zoom += 1.0f;
+                    g_main_image.zoom += 1.0f;
                     InvalidateRect(hwnd, NULL, FALSE);
                     break;
                 }
                 case 'X':
                 {
                     // TODO : zoom limits
-                    g_render.zoom -= 1.0f;
+                    g_main_image.zoom -= 1.0f;
                     InvalidateRect(hwnd, NULL, FALSE);
                     break;
                 }
@@ -1477,11 +1529,11 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             int my = GET_Y_LPARAM(lParam);
 
             // mouse down in the main image - start pan drag
-            g_render.dragging     = true;
-            g_render.drag_start_x = mx;
-            g_render.drag_start_y = my;
-            g_render.pan_start_x  = g_render.pan_x;
-            g_render.pan_start_y  = g_render.pan_y;
+            g_main_image.dragging     = true;
+            g_main_image.drag_start_x = mx;
+            g_main_image.drag_start_y = my;
+            g_main_image.pan_start_x  = g_main_image.pan_x;
+            g_main_image.pan_start_y  = g_main_image.pan_y;
 
             SetCapture(hwnd);
             return 0;
@@ -1492,7 +1544,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             // int mx = GET_X_LPARAM(lParam);
             // int my = GET_Y_LPARAM(lParam);
 
-            g_render.dragging = false;
+            g_main_image.dragging = false;
             ReleaseCapture();
             return 0;
         }
@@ -1502,10 +1554,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             int mx = GET_X_LPARAM(lParam);
             int my = GET_Y_LPARAM(lParam);
 
-            if (g_render.dragging)
+            if (g_main_image.dragging)
             {
-                g_render.pan_x = g_render.pan_start_x + (float)(mx - g_render.drag_start_x);
-                g_render.pan_y = g_render.pan_start_y + (float)(my - g_render.drag_start_y);
+                g_main_image.pan_x = g_main_image.pan_start_x + (float)(mx - g_main_image.drag_start_x);
+                g_main_image.pan_y = g_main_image.pan_start_y + (float)(my - g_main_image.drag_start_y);
 
                 InvalidateRect(hwnd, NULL, FALSE);
             }
@@ -1581,6 +1633,10 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             dprintf("Shutting down : cache\n");
             cache_cleanup();
 
+            dprintf("Shutting down : shuffle\n");
+            block_free(&g_shuffle.memory);
+            g_shuffle.map = NULL;
+
             DestroyWindow(hwnd);
             return 0;
         }
@@ -1611,7 +1667,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     if (FAILED(hr))
     {
         dprintf("wic_init failed: 0x%08X\n", (unsigned int)hr);
-        return 1; // Exit early since WIC isn't usable
+        return 1;
     }
 
     int     argc = 0;
@@ -1690,9 +1746,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     UnregisterClassW(class_name, hInstance);
 
-    if (g_files.data) vfree(g_files.data);
-    if (g_shuffle.map) vfree(g_shuffle.map);
     if (g_tj_handle) tjDestroy(g_tj_handle);
+
+    arena_free(&g_files.arena);
 
     return (int)msg.wParam;
 }
