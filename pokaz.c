@@ -294,6 +294,36 @@ static struct main_image g_main_image = {0};
 static void     image_full_path(uint16_t index, wchar_t *out, size_t out_cap);
 static uint16_t image_map_index(int offset);
 
+void file_list_remove_at(uint16_t idx)
+{
+    if (idx >= g_files.paths_count || g_files.paths_count == 0)
+    {
+        return;
+    }
+
+    uint16_t elements_to_move = g_files.paths_count - idx - 1;
+    if (elements_to_move > 0)
+    {
+        memmove(&g_files.file_names[idx],
+                &g_files.file_names[idx + 1],
+                elements_to_move * sizeof(wchar_t *));
+    }
+    g_files.file_names[g_files.paths_count] = NULL;
+
+    g_files.paths_count--;
+
+    if (g_files.paths_count == 0)
+    {
+        g_files.current = 0; // list is now empty
+    }
+    else if (g_files.current >= g_files.paths_count)
+    {
+        // if we deleted the very last file in the list, wrap back to the new end
+        g_files.current = g_files.paths_count - 1;
+    }
+    // leaving g_files.current unchanged automatically selects the next image
+}
+
 //
 // OPENGL
 //
@@ -1020,7 +1050,7 @@ static void image_show_current(void)
 
     EnterCriticalSection(&g_cache.lock);
     {
-        for (int j = 0; j < CACHE_CAPACITY; j++)
+        for (uint16_t j = 0; j < CACHE_CAPACITY; j++)
         {
             if (g_cache.entries[j].index == current_idx &&
                 g_cache.entries[j].state == CACHE_READY)
@@ -1391,6 +1421,74 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 case VK_ESCAPE:
                 {
                     PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                    break;
+                }
+                case VK_DELETE:
+                {
+                    uint16_t active_file = image_map_index(0);
+
+                    bool is_actively_decoding = false;
+
+                    EnterCriticalSection(&g_cache.lock);
+                    for (uint16_t j = 0; j < CACHE_CAPACITY; j++)
+                    {
+                        if (g_cache.entries[j].index == active_file &&
+                            g_cache.entries[j].state == CACHE_DECODING)
+                        {
+                            is_actively_decoding = true;
+                            break;
+                        }
+                    }
+                    LeaveCriticalSection(&g_cache.lock);
+
+                    if (is_actively_decoding)
+                    {
+                        dprintf("cannot delete: thread is currently reading this file\n");
+                        break;
+                    }
+
+                    wchar_t file_path[MAX_PATH + 2] = {0};
+                    image_full_path(active_file, file_path, MAX_PATH);
+                    dprintf("sending to recycling : '%ls'\n", file_path);
+
+                    // SHFILEOPSTRUCT requires a double-null-terminated string buffer
+                    SHFILEOPSTRUCT file_op = {
+                        .hwnd                  = NULL,
+                        .wFunc                 = FO_DELETE,
+                        .pFrom                 = file_path,
+                        .pTo                   = NULL,
+                        .fFlags                = FOF_ALLOWUNDO,
+                        .fAnyOperationsAborted = FALSE,
+                    };
+                    if (SHFileOperation(&file_op) == 0 && !file_op.fAnyOperationsAborted)
+                    {
+                        // need to evict the image from our cache
+                        dprintf("evicting image (%u) from cache and file list\n", active_file);
+                        file_list_remove_at(active_file);
+
+                        EnterCriticalSection(&g_cache.lock);
+                        for (uint16_t j = 0; j < CACHE_CAPACITY; j++)
+                        {
+                            if (g_cache.entries[j].state == CACHE_EMPTY) continue;
+
+                            if (g_cache.entries[j].index == active_file)
+                            {
+                                g_cache.entries[j].index = (uint16_t)(-1);
+                                g_cache.entries[j].state = CACHE_EMPTY;
+                            }
+                            else if (g_cache.entries[j].index > active_file)
+                            {
+                                g_cache.entries[j].index--;
+                            }
+                        }
+                        LeaveCriticalSection(&g_cache.lock);
+                        image_show_current();
+                        InvalidateRect(hwnd, NULL, FALSE);
+                    }
+                    else
+                    {
+                        dprintf("delete aborted or failed\n");
+                    }
                     break;
                 }
                 case VK_RIGHT:
