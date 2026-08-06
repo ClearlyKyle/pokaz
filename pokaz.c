@@ -416,6 +416,45 @@ static GLuint opengl_texture_upload(BYTE *buf, UINT w, UINT h, enum pixel_format
 }
 
 //
+// MAPPING FILES
+//
+
+struct file_map
+{
+    uint8_t *data;
+    size_t   size;
+    HANDLE   file_handle;
+    HANDLE   mapping_handle;
+};
+
+static bool file_map_read_only(const wchar_t *path, struct file_map *out_map)
+{
+    out_map->file_handle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (out_map->file_handle == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER file_size = {0};
+    GetFileSizeEx(out_map->file_handle, &file_size);
+    out_map->size = (size_t)file_size.QuadPart;
+
+    out_map->mapping_handle = CreateFileMappingW(out_map->file_handle, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!out_map->mapping_handle)
+    {
+        CloseHandle(out_map->file_handle);
+        return false;
+    }
+
+    out_map->data = MapViewOfFile(out_map->mapping_handle, FILE_MAP_READ, 0, 0, 0);
+    return out_map->data != NULL;
+}
+
+static void file_map_unmap(struct file_map *map)
+{
+    if (map->data) UnmapViewOfFile(map->data);
+    if (map->mapping_handle) CloseHandle(map->mapping_handle);
+    if (map->file_handle != INVALID_HANDLE_VALUE) CloseHandle(map->file_handle);
+}
+
+//
 // WIC
 //
 
@@ -443,10 +482,11 @@ static void wic_cleanup(void)
     CoUninitialize();
 }
 
-static bool wic_decode(struct mem_block *block, const wchar_t *path, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
+static bool wic_decode(struct file_map *map, struct mem_block *out_pixels, UINT *out_w, UINT *out_h, enum pixel_format *out_format)
 {
-    if (!block || !path || !out_w || !out_h || !out_format) return false;
+    if (!map || !out_pixels || !out_w || !out_h || !out_format) return false;
 
+    IWICStream            *stream  = NULL;
     IWICBitmapDecoder     *decoder = NULL;
     IWICBitmapFrameDecode *frame   = NULL;
     IWICFormatConverter   *conv    = NULL;
@@ -456,8 +496,14 @@ static bool wic_decode(struct mem_block *block, const wchar_t *path, UINT *out_w
     double time_start = time_in_ms();
 
     HRESULT hr;
-    hr = IWICImagingFactory_CreateDecoderFromFilename(g_wic, path, NULL, GENERIC_READ,
-                                                      WICDecodeMetadataCacheOnDemand, &decoder);
+    hr = IWICImagingFactory_CreateStream(g_wic, &stream);
+    if (FAILED(hr)) goto done;
+
+    hr = IWICStream_InitializeFromMemory(stream, (BYTE *)map->data, (DWORD)map->size);
+    if (FAILED(hr)) goto done;
+
+    hr = IWICImagingFactory_CreateDecoderFromStream(g_wic, (IStream *)stream, NULL,
+                                                    WICDecodeMetadataCacheOnDemand, &decoder);
     if (FAILED(hr)) goto done;
 
     hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
@@ -474,7 +520,7 @@ static bool wic_decode(struct mem_block *block, const wchar_t *path, UINT *out_w
 
     IWICFormatConverter_GetSize(conv, out_w, out_h);
 
-    void *pixels = block_commit(block, (size_t)((*out_w) * (*out_h) * 4));
+    void *pixels = block_commit(out_pixels, (size_t)((*out_w) * (*out_h) * 4));
     if (!pixels) goto done;
 
     hr = IWICFormatConverter_CopyPixels(conv, NULL,
@@ -490,6 +536,7 @@ done:
     if (conv) IWICFormatConverter_Release(conv);
     if (frame) IWICBitmapFrameDecode_Release(frame);
     if (decoder) IWICBitmapDecoder_Release(decoder);
+    if (stream) IWICStream_Release(stream);
 
     if (0)
     {
@@ -504,44 +551,23 @@ done:
 // TURBO JPEG
 //
 
-static tjhandle g_tj_handle = NULL;
+static tjhandle g_tj_handle = NULL; // handle for main thread
 
-static bool turbojpeg_decode(struct mem_block *block, tjhandle handle, const wchar_t *path, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
+static bool turbojpeg_decode(struct file_map *map, tjhandle handle, struct mem_block *out_pixels, UINT *out_w, UINT *out_h, enum pixel_format *out_format)
 {
-    if (!block || !handle || !path || !out_w || !out_h || !out_format) return false;
+    if (!map || !handle || !out_pixels || !out_w || !out_h || !out_format) return false;
 
-    BYTE  *file_buf = NULL;
-    bool   result   = false;
-    HANDLE f        = INVALID_HANDLE_VALUE;
-
+    bool   result     = false;
     double time_start = time_in_ms();
 
-    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                    OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (f == INVALID_HANDLE_VALUE) goto done;
-
-    LARGE_INTEGER file_size;
-    if (!GetFileSizeEx(f, &file_size)) goto done;
-
-    // TODO : prealloc
-    file_buf = vmalloc((size_t)file_size.QuadPart);
-    if (!file_buf) goto done;
-
-    DWORD bytes_read = 0;
-    if (!ReadFile(f, file_buf, (DWORD)file_size.QuadPart, &bytes_read, NULL) ||
-        bytes_read != (DWORD)file_size.QuadPart) goto done;
-
-    CloseHandle(f);
-    f = INVALID_HANDLE_VALUE;
-
     int w, h, subsamp, colour_space;
-    if (tjDecompressHeader3(handle, file_buf, (unsigned long)bytes_read,
+    if (tjDecompressHeader3(handle, map->data, (unsigned long)map->size,
                             &w, &h, &subsamp, &colour_space) < 0) goto done;
 
-    void *pixels = block_commit(block, (size_t)w * h * tjPixelSize[TJPF_BGRA]);
+    void *pixels = block_commit(out_pixels, (size_t)w * h * tjPixelSize[TJPF_BGRA]);
     if (!pixels) goto done;
 
-    if (tjDecompress2(handle, file_buf, (unsigned long)bytes_read,
+    if (tjDecompress2(handle, map->data, (unsigned long)map->size,
                       pixels, w, 0, h, TJPF_BGRA, TJFLAG_FASTDCT) < 0) goto done;
 
     *out_w      = (UINT)w;
@@ -551,20 +577,7 @@ static bool turbojpeg_decode(struct mem_block *block, tjhandle handle, const wch
     result = true;
 
 done:
-    if (f != INVALID_HANDLE_VALUE)
-    {
-        CloseHandle(f);
-    }
-
-    if (file_buf)
-    {
-        vfree(file_buf);
-    }
-
-    if (!result)
-    {
-        dprintf("decode_jpeg_turbo: %s\n", tjGetErrorStr2(handle));
-    }
+    if (!result) dprintf("decode_jpeg_turbo: %s\n", tjGetErrorStr2(handle));
 
     if (0)
     {
@@ -579,38 +592,17 @@ done:
 // SPNG
 //
 
-static bool decode_png_spng(struct mem_block *block, const wchar_t *path, UINT *out_w, UINT *out_h, pixel_format_t *out_format)
+static bool decode_png_spng(struct file_map *map, struct mem_block *out_pixels, UINT *out_w, UINT *out_h, enum pixel_format *out_format)
 {
-    if (!block || !path || !out_w || !out_h || !out_format) return false;
+    if (!map || !out_pixels || !out_w || !out_h || !out_format) return false;
 
-    BYTE     *file_buf = NULL;
-    spng_ctx *ctx      = NULL;
-    bool      result   = false;
-    HANDLE    f        = INVALID_HANDLE_VALUE;
-
+    bool   result     = false;
     double time_start = time_in_ms();
 
-    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                    OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (f == INVALID_HANDLE_VALUE) goto done;
-
-    LARGE_INTEGER file_size;
-    if (!GetFileSizeEx(f, &file_size)) goto done;
-
-    file_buf = vmalloc((size_t)file_size.QuadPart);
-    if (!file_buf) goto done;
-
-    DWORD bytes_read = 0;
-    if (!ReadFile(f, file_buf, (DWORD)file_size.QuadPart, &bytes_read, NULL) ||
-        bytes_read != (DWORD)file_size.QuadPart) goto done;
-
-    CloseHandle(f);
-    f = INVALID_HANDLE_VALUE;
-
-    ctx = spng_ctx_new(0);
+    spng_ctx *ctx = spng_ctx_new(0);
     if (!ctx) goto done;
 
-    if (spng_set_png_buffer(ctx, file_buf, (size_t)bytes_read) != 0) goto done;
+    if (spng_set_png_buffer(ctx, map->data, (size_t)map->size) != 0) goto done;
 
     struct spng_ihdr ihdr = {0};
     if (spng_get_ihdr(ctx, &ihdr) != 0) goto done;
@@ -623,10 +615,8 @@ static bool decode_png_spng(struct mem_block *block, const wchar_t *path, UINT *
     size_t out_size = 0;
     if (spng_decoded_image_size(ctx, fmt, &out_size) != 0) goto done;
 
-#ifndef IMAGES_PREALLOC
-    void *pixels = block_commit(block, out_size);
+    void *pixels = block_commit(out_pixels, out_size);
     if (!pixels) goto done;
-#endif
 
     if (spng_decode_image(ctx, pixels, out_size, fmt, 0) != 0) goto done;
 
@@ -638,20 +628,7 @@ static bool decode_png_spng(struct mem_block *block, const wchar_t *path, UINT *
     result = true;
 
 done:
-    if (f != INVALID_HANDLE_VALUE)
-    {
-        CloseHandle(f);
-    }
-
-    if (file_buf)
-    {
-        vfree(file_buf);
-    }
-
-    if (ctx)
-    {
-        spng_ctx_free(ctx);
-    }
+    if (ctx) spng_ctx_free(ctx);
 
     if (0)
     {
@@ -666,7 +643,7 @@ done:
 // DECODE
 //
 
-static bool decode_image(struct mem_block *block, tjhandle tj_handle, const wchar_t *path, UINT *w, UINT *h, pixel_format_t *out_format)
+static bool decode_image(struct mem_block *out_pixels, tjhandle tj_handle, const wchar_t *path, UINT *w, UINT *h, enum pixel_format *out_format)
 {
     bool result = false;
 
@@ -675,17 +652,22 @@ static bool decode_image(struct mem_block *block, tjhandle tj_handle, const wcha
     const wchar_t *ext = wcsrchr(path, L'.');
     if (ext)
     {
+        struct file_map file = {0};
+        if (!file_map_read_only(path, &file)) return false;
+
         if (_wcsicmp(ext, L".jpg") == 0 || _wcsicmp(ext, L".jpeg") == 0)
         {
-            result = turbojpeg_decode(block, tj_handle, path, w, h, out_format);
+            result = turbojpeg_decode(&file, tj_handle, out_pixels, w, h, out_format);
         }
         else if (_wcsicmp(ext, L".png") == 0)
         {
-            result = decode_png_spng(block, path, w, h, out_format);
+            result = decode_png_spng(&file, out_pixels, w, h, out_format);
         }
 
         // try again / defualt with wic
-        if (!result) result = wic_decode(block, path, w, h, out_format);
+        if (!result) result = wic_decode(&file, out_pixels, w, h, out_format);
+
+        file_map_unmap(&file);
     }
     else
     {
@@ -765,7 +747,6 @@ static DWORD WINAPI background_prefetch_thread(LPVOID arg)
         LeaveCriticalSection(&g_cache.lock);
         if (!found) continue;
 
-        // target is not in the cache
         uint16_t target = g_cache.entries[i].index;
 
         wchar_t full_path[MAX_PATH];
