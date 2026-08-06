@@ -1243,7 +1243,7 @@ static void scan_for_images(const wchar_t *dir)
         if (!is_ext_supported(fd.cFileName))
             continue;
 
-        size_t file_name_len = wcslen(fd.cFileName);
+        size_t file_name_len = wcslen(fd.cFileName) + 1; // +1 for L'\0'
 
         wchar_t *file_name_location = arena_alloc(&g_files.arena, file_name_len * sizeof(wchar_t));
         if (file_name_location)
