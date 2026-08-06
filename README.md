@@ -22,6 +22,8 @@ A high-performance, lightweight image viewer for Windows written in native C, ha
 | `←`, `Page Up`, or `A`     | Previous image           |
 | `Home`                     | First image              |
 | `End`                      | Last image               |
+| `Delete`                   | Delete current image     |
+| `O`                        | Open file location       |
 | `R`                        | Rotate 90°               |
 | `Z` or Mouse Wheel Up      | Zoom in                  |
 | `X` or Mouse Wheel Down    | Zoom out                 |
