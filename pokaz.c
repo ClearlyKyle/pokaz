@@ -1463,6 +1463,19 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     InvalidateRect(hwnd, NULL, FALSE);
                     break;
                 }
+                case 'O':
+                {
+                    uint16_t active_file = image_map_index(0);
+
+                    wchar_t file_path[MAX_PATH];
+                    image_full_path(active_file, file_path, MAX_PATH);
+
+                    char cmd[1024] = {0};
+                    snprintf(cmd, sizeof(cmd), "explorer.exe /select,\"%ls\"", file_path);
+                    system(cmd);
+                    break;
+                }
+
                 case 'T':
                 {
                     if (g_files.paths_count == 0) break;
