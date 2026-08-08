@@ -658,8 +658,8 @@ static bool decode_image(struct mem_block *out_pixels, tjhandle tj_handle, const
 // CACHE
 //
 
-#define CACHE_PRE_FETCH  (3)                                      // images behind
-#define CACHE_POST_FETCH (3)                                      // images ahead
+#define CACHE_PRE_FETCH  (2)                                      // images behind
+#define CACHE_POST_FETCH (2)                                      // images ahead
 #define CACHE_TOTAL_SIZE (CACHE_PRE_FETCH + CACHE_POST_FETCH + 1) // +1 for current
 
 #define THREAD_COUNT (2)
@@ -1016,15 +1016,6 @@ static void image_show_current(void)
 
     // rebuild the cache around the current index
     {
-        // TODO : this is very hardcoded, should be based on CACHE_CAPACITY
-        // uint32_t to_cache[5] = {
-        //    image_map_index(0),  // Current image
-        //    image_map_index(1),  // Next image
-        //    image_map_index(-1), // Previous image
-        //    image_map_index(2),  // +2 images ahead
-        //    image_map_index(-2)  // -2 images behind
-        //};
-
         int      count                      = 0;
         uint32_t to_cache[CACHE_TOTAL_SIZE] = {0};
         for (int32_t offset = -CACHE_PRE_FETCH; offset <= CACHE_POST_FETCH; offset++)
@@ -1242,6 +1233,8 @@ static void scan_for_images(const wchar_t *dir)
     } while (FindNextFileW(hf, &fd));
 
     FindClose(hf);
+
+    // TODO : we can do a sort here
 }
 
 static void scan_from_path(const wchar_t *path)
