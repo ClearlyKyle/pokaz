@@ -41,7 +41,7 @@
 #define WINDOW_START_H (1024)
 #define WINDOW_START_W (768)
 
-#define FILES_MAX_COUNT (65535)
+#define FILES_MAX_COUNT (99840) // 512 * 195
 
 // handles up to ~64 Megapixel images
 #define IMAGE_MAX_W         (4096)
@@ -214,6 +214,10 @@ struct file_list
     wchar_t   base_path[MAX_PATH]; // C:/folder/images/
     wchar_t **file_names;          // image1.jpg, image2.jpg...
 
+    uint32_t file_count;
+    uint32_t current;
+};
+
 struct main_image
 {
     GLuint tex;
@@ -234,10 +238,10 @@ static int g_win_h = WINDOW_START_H;
 static struct file_list  g_files      = {0};
 static struct main_image g_main_image = {0};
 
-static void     image_full_path(uint16_t index, wchar_t *out, size_t out_cap);
-static uint16_t image_map_index(int offset);
+static void     image_full_path(uint32_t index, wchar_t *out, size_t out_cap);
+static uint32_t image_map_index(int offset);
 
-void file_list_remove_at(uint16_t idx)
+void file_list_remove_at(uint32_t idx)
 {
     if (idx >= g_files.file_count || g_files.file_count == 0)
     {
@@ -654,8 +658,11 @@ static bool decode_image(struct mem_block *out_pixels, tjhandle tj_handle, const
 // CACHE
 //
 
-#define CACHE_CAPACITY (5) // current, next, previous
-#define THREAD_COUNT   (2)
+#define CACHE_PRE_FETCH  (3)                                      // images behind
+#define CACHE_POST_FETCH (3)                                      // images ahead
+#define CACHE_TOTAL_SIZE (CACHE_PRE_FETCH + CACHE_POST_FETCH + 1) // +1 for current
+
+#define THREAD_COUNT (2)
 
 enum cache_state
 {
@@ -673,7 +680,7 @@ struct thread_info
 
 struct cache_entry
 {
-    uint16_t         index;
+    uint32_t         index;
     enum cache_state state;
 
     enum pixel_format format;
@@ -684,8 +691,7 @@ struct cache_entry
 struct image_cache
 {
     CRITICAL_SECTION   lock;
-    struct cache_entry entries[CACHE_CAPACITY];
-    int                target_index; // The index the user is currently looking at
+    struct cache_entry entries[CACHE_TOTAL_SIZE];
 
     HANDLE threads[THREAD_COUNT];
     HANDLE semaphore;
@@ -708,7 +714,7 @@ static DWORD WINAPI background_prefetch_thread(LPVOID arg)
         int  i     = 0;
         bool found = false;
         EnterCriticalSection(&g_cache.lock);
-        for (; i < CACHE_CAPACITY; i++)
+        for (; i < CACHE_TOTAL_SIZE; i++)
         {
             if (g_cache.entries[i].state == CACHE_NEEDS_DECODING)
             {
@@ -720,12 +726,12 @@ static DWORD WINAPI background_prefetch_thread(LPVOID arg)
         LeaveCriticalSection(&g_cache.lock);
         if (!found) continue;
 
-        uint16_t target = g_cache.entries[i].index;
+        uint32_t target = g_cache.entries[i].index;
 
         wchar_t full_path[MAX_PATH];
         image_full_path(target, full_path, MAX_PATH);
 
-        if (0) dprintf("thread %u decoding %u, '%ls'\n", thread_id, target, full_path);
+        if (1) dprintf("thread %u decoding %u, '%ls'\n", thread_id, target, full_path);
 
         bool res = decode_image(&g_cache.entries[i].block,
                                 tj_handle,
@@ -755,9 +761,9 @@ static void cache_reset(void)
 {
     EnterCriticalSection(&g_cache.lock);
 
-    for (uint16_t i = 0; i < CACHE_CAPACITY; i++)
+    for (uint16_t i = 0; i < CACHE_TOTAL_SIZE; i++)
     {
-        g_cache.entries[i].index = (uint16_t)-1;
+        g_cache.entries[i].index = (uint32_t)-1;
         g_cache.entries[i].state = CACHE_EMPTY;
 
         if (!g_cache.entries[i].block.base)
@@ -773,9 +779,8 @@ static void cache_reset(void)
 static void cache_init(HWND hwnd)
 {
     InitializeCriticalSection(&g_cache.lock);
-    g_cache.semaphore    = CreateSemaphore(NULL, 0, CACHE_CAPACITY, NULL);
-    g_cache.target_index = 0;
-    g_cache.running      = true;
+    g_cache.semaphore = CreateSemaphore(NULL, 0, CACHE_TOTAL_SIZE, NULL);
+    g_cache.running   = true;
 
     cache_reset();
 
@@ -804,7 +809,7 @@ static void cache_cleanup(void)
 
     if (!CloseHandle(g_cache.semaphore)) dprintf("g_cache.semaphore close issue\n");
 
-    for (uint16_t i = 0; i < CACHE_CAPACITY; i++)
+    for (uint16_t i = 0; i < CACHE_TOTAL_SIZE; i++)
     {
         block_free(&g_cache.entries[i].block);
     }
@@ -818,7 +823,7 @@ static void cache_cleanup(void)
 
 struct shuffle
 {
-    uint16_t        *map;
+    uint32_t        *map;
     struct mem_block memory;
 
     bool is_shuffle;
@@ -826,7 +831,7 @@ struct shuffle
 
 static struct shuffle g_shuffle = {.is_shuffle = false};
 
-static void shuffle_map_generate(uint16_t pin)
+static void shuffle_map_generate(uint32_t pin)
 {
     if (!g_shuffle.map)
     {
@@ -838,7 +843,7 @@ static void shuffle_map_generate(uint16_t pin)
     g_shuffle.map = block_ensure_commit(&g_shuffle.memory, sizeof(uint32_t) * g_files.file_count);
     if (!g_shuffle.map) return;
 
-    for (uint16_t i = 0; i < g_files.paths_count; i++)
+    for (uint32_t i = 0; i < g_files.file_count; i++)
     {
         g_shuffle.map[i] = i;
     }
@@ -848,7 +853,7 @@ static void shuffle_map_generate(uint16_t pin)
     // uint16_t current_file_index = image_map_index(0);
     if (pin < g_files.file_count)
     {
-        uint16_t temp      = g_shuffle.map[0];
+        uint32_t temp      = g_shuffle.map[0];
         g_shuffle.map[0]   = g_shuffle.map[pin];
         g_shuffle.map[pin] = temp;
     }
@@ -863,13 +868,14 @@ static void shuffle_map_generate(uint16_t pin)
     // Fisher-Yates Shuffle
     for (uint32_t i = g_files.file_count - 1; i > 1; i--)
     {
-        // ensuring we can safely shuffle up to 65535 (uint16_t max) items
-        uint32_t large_rand = ((rand() << 15) | rand());
+        uint32_t r1         = (uint32_t)rand() & 0x7FFF;
+        uint32_t r2         = (uint32_t)rand() & 0x7FFF;
+        uint32_t large_rand = (r1 << 15) | r2;
 
-        // we dont want to move our first element
-        uint16_t j = 1 + (uint16_t)(large_rand % i);
+        // random index in range [1, i] we dont want to move our first element
+        uint32_t j = 1 + (large_rand % i);
 
-        uint16_t temp    = g_shuffle.map[i];
+        uint32_t temp    = g_shuffle.map[i];
         g_shuffle.map[i] = g_shuffle.map[j];
         g_shuffle.map[j] = temp;
     }
@@ -948,7 +954,7 @@ static void slideshow_advance(void)
 // RENDER
 //
 
-static void image_full_path(uint16_t index, wchar_t *out, size_t out_cap)
+static void image_full_path(uint32_t index, wchar_t *out, size_t out_cap)
 {
     swprintf_s(out, out_cap, L"%s\\%s", g_files.base_path, g_files.file_names[index]);
 }
@@ -961,7 +967,7 @@ static inline void image_reset_view(void)
     g_main_image.rotation = 0;
 }
 
-static uint16_t image_map_index(int offset)
+static uint32_t image_map_index(int offset)
 {
     if (g_files.file_count == 0) return 0;
 
@@ -976,7 +982,7 @@ static uint16_t image_map_index(int offset)
         return g_shuffle.map[pos];
     }
 
-    return (uint16_t)pos;
+    return (uint32_t)pos;
 }
 
 static void image_show_current(void)
@@ -984,7 +990,7 @@ static void image_show_current(void)
     if (g_files.file_count == 0) return;
 
     image_reset_view();
-    uint16_t current_idx = image_map_index(0);
+    uint32_t current_idx = image_map_index(0);
 
     BYTE             *pixels_to_upload = NULL;
     enum pixel_format format           = 0;
@@ -993,7 +999,7 @@ static void image_show_current(void)
 
     EnterCriticalSection(&g_cache.lock);
     {
-        for (uint16_t j = 0; j < CACHE_CAPACITY; j++)
+        for (uint16_t j = 0; j < CACHE_TOTAL_SIZE; j++)
         {
             if (g_cache.entries[j].index == current_idx &&
                 g_cache.entries[j].state == CACHE_READY)
@@ -1011,22 +1017,32 @@ static void image_show_current(void)
     // rebuild the cache around the current index
     {
         // TODO : this is very hardcoded, should be based on CACHE_CAPACITY
-        uint16_t to_cache[5] = {
-            image_map_index(0),  // Current image
-            image_map_index(1),  // Next image
-            image_map_index(-1), // Previous image
-            image_map_index(2),  // +2 images ahead
-            image_map_index(-2)  // -2 images behind
-        };
+        // uint32_t to_cache[5] = {
+        //    image_map_index(0),  // Current image
+        //    image_map_index(1),  // Next image
+        //    image_map_index(-1), // Previous image
+        //    image_map_index(2),  // +2 images ahead
+        //    image_map_index(-2)  // -2 images behind
+        //};
+
+        int      count                      = 0;
+        uint32_t to_cache[CACHE_TOTAL_SIZE] = {0};
+        for (int32_t offset = -CACHE_PRE_FETCH; offset <= CACHE_POST_FETCH; offset++)
+        {
+            to_cache[count++] = image_map_index(offset);
+        }
 
         // when less images than the cache size
-        int active_targets = (g_files.paths_count < 5) ? g_files.paths_count : 5;
-        for (int t = 0; t < active_targets; t++)
+        int active_targets = (g_files.file_count < CACHE_TOTAL_SIZE)
+                                 ? g_files.file_count
+                                 : CACHE_TOTAL_SIZE;
+
+        for (uint16_t t = 0; t < active_targets; t++)
         {
-            uint16_t target = to_cache[t];
+            uint32_t target = to_cache[t];
 
             bool already_cached = false;
-            for (uint16_t j = 0; j < CACHE_CAPACITY; j++)
+            for (uint16_t j = 0; j < CACHE_TOTAL_SIZE; j++)
             {
                 if (g_cache.entries[j].index == target &&
                     g_cache.entries[j].state != CACHE_EMPTY)
@@ -1038,15 +1054,21 @@ static void image_show_current(void)
             if (already_cached) continue;
 
             // find a slot whose index is NOT in to_cache[] - safe to evict
-            for (uint16_t j = 0; j < CACHE_CAPACITY; j++)
+            for (uint16_t j = 0; j < CACHE_TOTAL_SIZE; j++)
             {
-                uint16_t cached_idx = g_cache.entries[j].index;
+                uint32_t cached_idx = g_cache.entries[j].index;
 
-                if (cached_idx != to_cache[0] &&
-                    cached_idx != to_cache[1] &&
-                    cached_idx != to_cache[2] &&
-                    cached_idx != to_cache[3] &&
-                    cached_idx != to_cache[4])
+                bool is_in_use = false;
+                for (uint16_t k = 0; k < CACHE_TOTAL_SIZE; k++)
+                {
+                    if (cached_idx == to_cache[k])
+                    {
+                        is_in_use = true;
+                        break;
+                    }
+                }
+
+                if (!is_in_use)
                 {
                     g_cache.entries[j].state = CACHE_NEEDS_DECODING;
                     g_cache.entries[j].index = target;
@@ -1280,6 +1302,35 @@ static void scan_from_path(const wchar_t *path)
 // WIN MAIN/PROC
 //
 
+#if DEBUG
+static void _cache_debug_title(wchar_t *buff, size_t capacity)
+{
+    size_t offset = 0;
+
+    EnterCriticalSection(&g_cache.lock);
+
+    int written = swprintf_s(buff + offset, capacity - offset, L"[");
+    if (written > 0) offset += written;
+
+    for (uint16_t i = 0; i < CACHE_TOTAL_SIZE; i++)
+    {
+        double mb = (double)g_cache.entries[i].block.committed / (1024.0 * 1024.0);
+
+        const wchar_t *format = (i == 0) ? L"(%u) %0.1fMB" : L", (%u) %0.1fMB";
+
+        written = swprintf_s(buff + offset, capacity - offset, format,
+                             g_cache.entries[i].index, mb);
+
+        if (written > 0) offset += written;
+        else break; // buffer full
+    }
+
+    swprintf_s(buff + offset, capacity - offset, L"]");
+
+    LeaveCriticalSection(&g_cache.lock);
+}
+#endif
+
 static void window_update_title(HWND hWnd)
 {
     if (g_files.file_count == 0)
@@ -1290,7 +1341,7 @@ static void window_update_title(HWND hWnd)
 
     const wchar_t *name = g_files.file_names[g_files.current];
 
-    uint16_t current_idx = image_map_index(0) + 1;
+    uint32_t current_idx = image_map_index(0) + 1;
 
     wchar_t title[256] = {0};
     if (g_slide.active)
@@ -1315,14 +1366,7 @@ static void window_update_title(HWND hWnd)
 
 #if DEBUG
     wchar_t cache_mem_state[256] = {0};
-    EnterCriticalSection(&g_cache.lock);
-    swprintf_s(cache_mem_state, 256, L"[(%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB, (%u) %0.1fMB]",
-               g_cache.entries[0].index, g_cache.entries[0].block.committed / 1024.0 / 1024.0,
-               g_cache.entries[1].index, g_cache.entries[1].block.committed / 1024.0 / 1024.0,
-               g_cache.entries[2].index, g_cache.entries[2].block.committed / 1024.0 / 1024.0,
-               g_cache.entries[3].index, g_cache.entries[3].block.committed / 1024.0 / 1024.0,
-               g_cache.entries[4].index, g_cache.entries[4].block.committed / 1024.0 / 1024.0);
-    LeaveCriticalSection(&g_cache.lock);
+    _cache_debug_title(cache_mem_state, 256);
 
     wchar_t full[512] = {0};
     swprintf_s(full, 512, L"%s %s", cache_mem_state, title);
@@ -1342,7 +1386,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 
             // can only get here on CACHE_READY state
             EnterCriticalSection(&g_cache.lock);
-            uint16_t current_index = image_map_index(0);
+            uint32_t current_index = image_map_index(0);
             if (entry->index == current_index)
             {
                 if (g_main_image.tex != 0) glDeleteTextures(1, &g_main_image.tex);
@@ -1377,12 +1421,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 }
                 case VK_DELETE:
                 {
-                    uint16_t active_file = image_map_index(0);
+                    uint32_t active_file = image_map_index(0);
 
                     bool is_actively_decoding = false;
 
                     EnterCriticalSection(&g_cache.lock);
-                    for (uint16_t j = 0; j < CACHE_CAPACITY; j++)
+                    for (uint16_t j = 0; j < CACHE_TOTAL_SIZE; j++)
                     {
                         if (g_cache.entries[j].index == active_file &&
                             g_cache.entries[j].state == CACHE_DECODING)
@@ -1419,13 +1463,13 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                         file_list_remove_at(active_file);
 
                         EnterCriticalSection(&g_cache.lock);
-                        for (uint16_t j = 0; j < CACHE_CAPACITY; j++)
+                        for (uint16_t j = 0; j < CACHE_TOTAL_SIZE; j++)
                         {
                             if (g_cache.entries[j].state == CACHE_EMPTY) continue;
 
                             if (g_cache.entries[j].index == active_file)
                             {
-                                g_cache.entries[j].index = (uint16_t)(-1);
+                                g_cache.entries[j].index = (uint32_t)(-1);
                                 g_cache.entries[j].state = CACHE_EMPTY;
                             }
                             else if (g_cache.entries[j].index > active_file)
@@ -1515,7 +1559,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 }
                 case 'O':
                 {
-                    uint16_t active_file = image_map_index(0);
+                    uint32_t active_file = image_map_index(0);
 
                     wchar_t file_path[MAX_PATH];
                     image_full_path(active_file, file_path, MAX_PATH);
@@ -1532,14 +1576,14 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 
                     if (!g_shuffle.is_shuffle)
                     {
-                        uint16_t active_file = image_map_index(0);
+                        uint32_t active_file = image_map_index(0);
                         g_shuffle.is_shuffle = true; // must be toggled AFTER image_map_index
 
                         shuffle_map_generate(active_file);
                     }
                     else
                     {
-                        uint16_t active_file = image_map_index(0);
+                        uint32_t active_file = image_map_index(0);
                         g_files.current      = active_file;
                         g_shuffle.is_shuffle = false; // must be toggled AFTER image_map_index
                     }
