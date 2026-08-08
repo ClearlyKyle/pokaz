@@ -122,104 +122,35 @@ static inline size_t align_to_page(size_t size)
 }
 
 //
-// ARENA
+// BLOCKS / ARENA
 //
-
-struct arena
-{
-    uint8_t *base;
-    size_t   capacity;
-    size_t   committed;
-    size_t   used;
-};
-
-static bool arena_init(struct arena *arena, size_t reserve_bytes)
-{
-    if (!arena) return false;
-
-    arena->base = VirtualAlloc(
-        NULL,
-        reserve_bytes,
-        MEM_RESERVE,
-        PAGE_NOACCESS // access prohibited until explicitly committed
-    );
-    if (!arena->base) return false;
-
-    arena->capacity  = reserve_bytes;
-    arena->committed = 0;
-    arena->used      = 0;
-
-    return true;
-}
-
-static void *arena_alloc(struct arena *arena, size_t size)
-{
-    size_t align          = sizeof(void *);
-    size_t aligned_offset = align_forward(arena->used, align);
-
-    size_t total_size = aligned_offset + size;
-
-    if (total_size > arena->capacity) return NULL;
-
-    if (total_size > arena->committed)
-    {
-        size_t bytes_needed = total_size - arena->committed;
-        size_t commit_size  = align_to_page(bytes_needed);
-
-        void *commit_result = VirtualAlloc(
-            (uint8_t *)arena->base + arena->committed,
-            commit_size,
-            MEM_COMMIT,
-            PAGE_READWRITE);
-
-        if (!commit_result) return NULL;
-        arena->committed += commit_size;
-    }
-
-    void *ptr   = (uint8_t *)arena->base + aligned_offset;
-    arena->used = total_size;
-
-    return ptr;
-}
-
-static void arena_free(struct arena *arena)
-{
-    if (arena && arena->base)
-    {
-        VirtualFree(arena->base, 0, MEM_RELEASE);
-        arena->base      = NULL;
-        arena->capacity  = 0;
-        arena->committed = 0;
-        arena->used      = 0;
-    }
-}
 
 struct mem_block
 {
     uint8_t *base;
     size_t   max_capacity;
     size_t   committed;
+    size_t   used;
 };
 
-static struct mem_block block_init(size_t max_capacity)
+static void *block_init(struct mem_block *block, size_t max_capacity)
 {
-    struct mem_block block = {0};
-
     size_t reserve_size = align_to_page(max_capacity);
 
-    block.base = VirtualAlloc(
+    block->base = VirtualAlloc(
         NULL,
         reserve_size,
         MEM_RESERVE,
         PAGE_NOACCESS // access prohibited until explicitly committed
     );
-    block.max_capacity = (block.base != NULL) ? max_capacity : 0;
-    block.committed    = 0;
+    block->max_capacity = (block->base != NULL) ? max_capacity : 0;
+    block->committed    = 0;
+    block->used         = 0;
 
-    return block;
+    return block->base;
 }
 
-static void *block_commit(struct mem_block *block, size_t needed_size)
+static void *block_ensure_commit(struct mem_block *block, size_t needed_size)
 {
     if (!block || !block->base) return NULL;
 
@@ -245,7 +176,23 @@ static void *block_commit(struct mem_block *block, size_t needed_size)
     return block->base;
 }
 
-void block_free(struct mem_block *block)
+static void *block_arena_alloc(struct mem_block *block, size_t size)
+{
+    if (!block || size == 0) return NULL;
+
+    size_t needed_size = block->used + size;
+
+    if (!block_ensure_commit(block, needed_size))
+    {
+        return NULL;
+    }
+
+    void *ptr   = block->base + block->used;
+    block->used = needed_size;
+    return ptr;
+}
+
+static void block_free(struct mem_block *block)
 {
     if (block && block->base)
     {
@@ -262,14 +209,10 @@ void block_free(struct mem_block *block)
 
 struct file_list
 {
-    struct arena arena;
+    struct mem_block block;
 
-    wchar_t  base_path[MAX_PATH];         // C:/folder/images/
-    wchar_t *file_names[FILES_MAX_COUNT]; // image1.jpg, image2.jpg...
-
-    uint16_t paths_count;
-    uint16_t current;
-};
+    wchar_t   base_path[MAX_PATH]; // C:/folder/images/
+    wchar_t **file_names;          // image1.jpg, image2.jpg...
 
 struct main_image
 {
@@ -296,30 +239,30 @@ static uint16_t image_map_index(int offset);
 
 void file_list_remove_at(uint16_t idx)
 {
-    if (idx >= g_files.paths_count || g_files.paths_count == 0)
+    if (idx >= g_files.file_count || g_files.file_count == 0)
     {
         return;
     }
 
-    uint16_t elements_to_move = g_files.paths_count - idx - 1;
+    uint32_t elements_to_move = g_files.file_count - idx - 1;
     if (elements_to_move > 0)
     {
         memmove(&g_files.file_names[idx],
                 &g_files.file_names[idx + 1],
                 elements_to_move * sizeof(wchar_t *));
     }
-    g_files.file_names[g_files.paths_count] = NULL;
+    g_files.file_names[g_files.file_count] = NULL;
 
-    g_files.paths_count--;
+    g_files.file_count--;
 
-    if (g_files.paths_count == 0)
+    if (g_files.file_count == 0)
     {
         g_files.current = 0; // list is now empty
     }
-    else if (g_files.current >= g_files.paths_count)
+    else if (g_files.current >= g_files.file_count)
     {
         // if we deleted the very last file in the list, wrap back to the new end
-        g_files.current = g_files.paths_count - 1;
+        g_files.current = g_files.file_count - 1;
     }
     // leaving g_files.current unchanged automatically selects the next image
 }
@@ -550,7 +493,7 @@ static bool wic_decode(struct file_map *map, struct mem_block *out_pixels, UINT 
 
     IWICFormatConverter_GetSize(conv, out_w, out_h);
 
-    void *pixels = block_commit(out_pixels, (size_t)((*out_w) * (*out_h) * 4));
+    void *pixels = block_ensure_commit(out_pixels, (size_t)((*out_w) * (*out_h) * 4));
     if (!pixels) goto done;
 
     hr = IWICFormatConverter_CopyPixels(conv, NULL,
@@ -594,7 +537,7 @@ static bool turbojpeg_decode(struct file_map *map, tjhandle handle, struct mem_b
     if (tjDecompressHeader3(handle, map->data, (unsigned long)map->size,
                             &w, &h, &subsamp, &colour_space) < 0) goto done;
 
-    void *pixels = block_commit(out_pixels, (size_t)w * h * tjPixelSize[TJPF_BGRA]);
+    void *pixels = block_ensure_commit(out_pixels, (size_t)w * h * tjPixelSize[TJPF_BGRA]);
     if (!pixels) goto done;
 
     if (tjDecompress2(handle, map->data, (unsigned long)map->size,
@@ -645,7 +588,7 @@ static bool decode_png_spng(struct file_map *map, struct mem_block *out_pixels, 
     size_t out_size = 0;
     if (spng_decoded_image_size(ctx, fmt, &out_size) != 0) goto done;
 
-    void *pixels = block_commit(out_pixels, out_size);
+    void *pixels = block_ensure_commit(out_pixels, out_size);
     if (!pixels) goto done;
 
     if (spng_decode_image(ctx, pixels, out_size, fmt, 0) != 0) goto done;
@@ -819,7 +762,7 @@ static void cache_reset(void)
 
         if (!g_cache.entries[i].block.base)
         {
-            g_cache.entries[i].block = block_init(IMAGE_PREALLOC_SIZE);
+            block_init(&g_cache.entries[i].block, IMAGE_PREALLOC_SIZE);
         }
         // NOTE : we would release the block back to the OS again here
     }
@@ -887,12 +830,12 @@ static void shuffle_map_generate(uint16_t pin)
 {
     if (!g_shuffle.map)
     {
-        g_shuffle.memory = block_init(sizeof(uint16_t) * FILES_MAX_COUNT);
+        block_init(&g_shuffle.memory, sizeof(uint32_t) * FILES_MAX_COUNT);
     }
 
-    if (g_files.paths_count == 0) return;
+    if (g_files.file_count == 0) return;
 
-    g_shuffle.map = block_commit(&g_shuffle.memory, sizeof(uint16_t) * g_files.paths_count);
+    g_shuffle.map = block_ensure_commit(&g_shuffle.memory, sizeof(uint32_t) * g_files.file_count);
     if (!g_shuffle.map) return;
 
     for (uint16_t i = 0; i < g_files.paths_count; i++)
@@ -903,7 +846,7 @@ static void shuffle_map_generate(uint16_t pin)
     // if we didnt swap these, when we choose random we would jump to the first random
     // image but it wont be displayed, as our cache lags behind.
     // uint16_t current_file_index = image_map_index(0);
-    if (pin < g_files.paths_count)
+    if (pin < g_files.file_count)
     {
         uint16_t temp      = g_shuffle.map[0];
         g_shuffle.map[0]   = g_shuffle.map[pin];
@@ -918,7 +861,7 @@ static void shuffle_map_generate(uint16_t pin)
     }
 
     // Fisher-Yates Shuffle
-    for (uint16_t i = g_files.paths_count - 1; i > 1; i--)
+    for (uint32_t i = g_files.file_count - 1; i > 1; i--)
     {
         // ensuring we can safely shuffle up to 65535 (uint16_t max) items
         uint32_t large_rand = ((rand() << 15) | rand());
@@ -936,7 +879,7 @@ static void shuffle_map_generate(uint16_t pin)
 #if DEBUG
     dprintf("shuffle_map_generate\n");
     dprintf("[");
-    for (uint16_t i = 0; i < g_files.paths_count; i++)
+    for (uint32_t i = 0; i < g_files.file_count; i++)
     {
         dprintf("%s%u", (i == 0) ? "" : ", ", g_shuffle.map[i]);
     }
@@ -974,7 +917,7 @@ static void slideshow_start(HWND hWnd)
 {
     dprintf("slideshow START\n");
 
-    if (g_files.paths_count <= 1) return;
+    if (g_files.file_count <= 1) return;
 
     g_slide.active = true;
     slideshow_rearm(hWnd);
@@ -995,10 +938,10 @@ static inline void slideshow_toggle(HWND hWnd)
 
 static void slideshow_advance(void)
 {
-    if (g_files.paths_count <= 1) return;
+    if (g_files.file_count <= 1) return;
 
     // same as a "right" move
-    g_files.current = (g_files.current + 1) % g_files.paths_count;
+    g_files.current = (g_files.current + 1) % g_files.file_count;
 }
 
 //
@@ -1020,10 +963,10 @@ static inline void image_reset_view(void)
 
 static uint16_t image_map_index(int offset)
 {
-    if (g_files.paths_count == 0) return 0;
+    if (g_files.file_count == 0) return 0;
 
-    int count   = (int)g_files.paths_count;
-    int current = (int)g_files.current;
+    int count   = g_files.file_count;
+    int current = g_files.current;
 
     int pos = (current + offset) % count;
     if (pos < 0) pos += count;
@@ -1038,7 +981,7 @@ static uint16_t image_map_index(int offset)
 
 static void image_show_current(void)
 {
-    if (g_files.paths_count == 0) return;
+    if (g_files.file_count == 0) return;
 
     image_reset_view();
     uint16_t current_idx = image_map_index(0);
@@ -1223,13 +1166,18 @@ static void scan_for_images(const wchar_t *dir)
 {
     dprintf("scan_for_images : '%ls'\n", dir);
 
-    if (!g_files.arena.base)
+    if (!g_files.block.base)
     {
-        if (!arena_init(&g_files.arena, MB(64))) return;
+        size_t file_pointer_array_size = sizeof(wchar_t *) * FILES_MAX_COUNT;
+        size_t file_names_size         = sizeof(wchar_t) * MAX_PATH * FILES_MAX_COUNT;
+        size_t total_size              = file_pointer_array_size + file_names_size;
+        if (!block_init(&g_files.block, total_size)) return;
+
+        g_files.file_names = block_arena_alloc(&g_files.block, file_pointer_array_size);
     }
 
-    g_files.paths_count = 0;
-    g_files.current     = 0;
+    g_files.file_count = 0;
+    g_files.current    = 0;
 
     wchar_t pattern[MAX_PATH] = {0};
     swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
@@ -1245,7 +1193,7 @@ static void scan_for_images(const wchar_t *dir)
 
     do
     {
-        if (g_files.paths_count >= FILES_MAX_COUNT)
+        if (g_files.file_count >= FILES_MAX_COUNT)
             break;
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
@@ -1256,13 +1204,17 @@ static void scan_for_images(const wchar_t *dir)
 
         size_t file_name_len = wcslen(fd.cFileName) + 1; // +1 for L'\0'
 
-        wchar_t *file_name_location = arena_alloc(&g_files.arena, file_name_len * sizeof(wchar_t));
+        wchar_t *file_name_location = block_arena_alloc(&g_files.block, file_name_len * sizeof(wchar_t));
         if (file_name_location)
         {
             wmemcpy(file_name_location, fd.cFileName, file_name_len);
 
-            g_files.file_names[g_files.paths_count] = file_name_location;
-            g_files.paths_count++;
+            g_files.file_names[g_files.file_count] = file_name_location;
+            g_files.file_count++;
+
+            // TODO : should we start decoding images once we have atleast 1 to be cached?
+            // if (g_files.file_count < CACHE_TOTAL_SIZE)
+            //    ReleaseSemaphore(g_cache.semaphore, 1, NULL);
         }
 
     } while (FindNextFileW(hf, &fd));
@@ -1302,7 +1254,7 @@ static void scan_from_path(const wchar_t *path)
 
     if (file_name && is_ext_supported(file_name))
     {
-        for (uint16_t i = 0; i < g_files.paths_count; i++)
+        for (uint16_t i = 0; i < g_files.file_count; i++)
         {
             if (_wcsicmp(g_files.file_names[i], file_name) == 0)
             {
@@ -1317,7 +1269,7 @@ static void scan_from_path(const wchar_t *path)
     if (0)
     {
         dprintf("Loaded images from: '%ls'\n", path);
-        for (uint16_t i = 0; i < g_files.paths_count; i++)
+        for (uint16_t i = 0; i < g_files.file_count; i++)
         {
             dprintf("    '%ls' %s\n", g_files.file_names[i], g_files.current == i ? "<--" : "");
         }
@@ -1330,7 +1282,7 @@ static void scan_from_path(const wchar_t *path)
 
 static void window_update_title(HWND hWnd)
 {
-    if (g_files.paths_count == 0)
+    if (g_files.file_count == 0)
     {
         SetWindowTextW(hWnd, L"Pokaz - no images found");
         return;
@@ -1348,7 +1300,7 @@ static void window_update_title(HWND hWnd)
         swprintf_s(title, 256, L"[\u25b6 %.1fs] %s [%d / %d] %s (%d \u00d7 %d)",
                    secs,
                    g_shuffle.is_shuffle ? L"[\u21c4] " : L"",
-                   current_idx, g_files.paths_count,
+                   current_idx, g_files.file_count,
                    name,
                    g_main_image.w, g_main_image.h);
     }
@@ -1356,7 +1308,7 @@ static void window_update_title(HWND hWnd)
     {
         swprintf_s(title, 256, L"%s [%d / %d] %s (%d \u00d7 %d)",
                    g_shuffle.is_shuffle ? L"[\u21c4] " : L"",
-                   current_idx, g_files.paths_count,
+                   current_idx, g_files.file_count,
                    name,
                    g_main_image.w, g_main_image.h);
     }
@@ -1495,9 +1447,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 case VK_NEXT:
                 case 'D':
                 {
-                    if (g_files.paths_count > 0)
+                    if (g_files.file_count > 0)
                     {
-                        g_files.current = (g_files.current + 1) % g_files.paths_count;
+                        g_files.current = (g_files.current + 1) % g_files.file_count;
                         image_show_current();
                         InvalidateRect(hwnd, NULL, FALSE);
                     }
@@ -1507,9 +1459,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 case VK_PRIOR:
                 case 'A':
                 {
-                    if (g_files.paths_count > 0)
+                    if (g_files.file_count > 0)
                     {
-                        g_files.current = (g_files.current + g_files.paths_count - 1) % g_files.paths_count;
+                        g_files.current = (g_files.current + g_files.file_count - 1) % g_files.file_count;
                         image_show_current();
                         InvalidateRect(hwnd, NULL, FALSE);
                     }
@@ -1517,7 +1469,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 }
                 case VK_HOME:
                 {
-                    if (g_files.paths_count > 0)
+                    if (g_files.file_count > 0)
                     {
                         g_files.current = 0;
                         image_show_current();
@@ -1527,9 +1479,9 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                 }
                 case VK_END:
                 {
-                    if (g_files.paths_count > 0)
+                    if (g_files.file_count > 0)
                     {
-                        g_files.current = g_files.paths_count - 1;
+                        g_files.current = g_files.file_count - 1;
                         image_show_current();
                         InvalidateRect(hwnd, NULL, FALSE);
                     }
@@ -1576,7 +1528,7 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
 
                 case 'T':
                 {
-                    if (g_files.paths_count == 0) break;
+                    if (g_files.file_count == 0) break;
 
                     if (!g_shuffle.is_shuffle)
                     {
@@ -1751,8 +1703,8 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
             cache_cleanup();
 
             dprintf("Shutting down : shuffle\n");
+            slideshow_stop(hwnd);
             block_free(&g_shuffle.memory);
-            g_shuffle.map = NULL;
 
             DestroyWindow(hwnd);
             return 0;
@@ -1865,7 +1817,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     if (g_tj_handle) tjDestroy(g_tj_handle);
 
-    arena_free(&g_files.arena);
+    block_free(&g_files.block);
 
     return (int)msg.wParam;
 }
