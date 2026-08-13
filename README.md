@@ -1,11 +1,11 @@
 
 # pokaz
 
-A high-performance, lightweight image viewer for Windows written in native C, hardware-accelerated via OpenGL with the help of decoders (`libspng`, `libjpeg-turbo`) paired with native WIC integration.
+A high-performance, lightweight image viewer for Windows written in native C, hardware-accelerated via OpenGL with the help of decoders (`libspng`, `libjpeg-turbo`, `libavif`) paired with native WIC integration.
 
 ## Supported Formats
 - **Standard:** PNG, JPEG, BMP, GIF, TIFF, ICO
-- **Modern & Extended:** WebP, JXR, HDP, WDP
+- **Modern & Extended:** WebP, JXR, HDP, WDP, AVIF
 
 
 ## Usage
@@ -34,3 +34,10 @@ A high-performance, lightweight image viewer for Windows written in native C, ha
 | `-`                        | Decrease slideshow speed |
 | Drag & drop onto window    | Open a file/folder       |
 | `Esc`                      | Quit                     |
+
+## Dependencies
+
+* **[libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo)** – JPEG decoding
+* **[libspng](https://github.com/randy408/libspng)** – PNG decoding
+* **[libavif](https://github.com/AOMediaCodec/libavif)** – AVIF image container parsing (requires `dav1d`)
+

@@ -14,6 +14,8 @@
 
 #include <GL/gl.h>
 
+#include "avif/avif.h"
+
 #define SPNG_USE_MINIZ
 #define SPNG_STATIC
 #include "deps/spng.h"
@@ -28,6 +30,7 @@
 #pragma comment(lib, "gdi32")
 #pragma comment(lib, "ole32")
 #pragma comment(lib, "windowscodecs")
+#pragma comment(lib, "avif")
 
 //
 // DEFINES
@@ -53,7 +56,7 @@
 static const wchar_t *SUPPORTED_EXTENSIONS[] = {
     L".jpg", L".jpeg", L".png", L".bmp", L".gif",
     L".tiff", L".tif", L".ico", L".webp", L".wdp",
-    L".hdp", L".jxr"};
+    L".hdp", L".jxr", L".avif"};
 
 //
 // DEBUG
@@ -617,6 +620,80 @@ done:
 }
 
 //
+// AVIF
+//
+
+static bool decode_avif(struct file_map *map, struct mem_block *out_pixels, UINT *out_w, UINT *out_h, enum pixel_format *out_format)
+{
+    bool result = false;
+
+    avifDecoder *decoder = avifDecoderCreate();
+    if (!decoder)
+    {
+        return false;
+    }
+
+    // how much of the spec do we want to respect
+    decoder->strictFlags = AVIF_STRICT_ENABLED & ~AVIF_STRICT_PIXI_REQUIRED;
+    // decoder->strictFlags = AVIF_STRICT_DISABLED; // yolo
+
+    if (avifDecoderSetIOMemory(decoder, map->data, map->size) != AVIF_RESULT_OK)
+    {
+        dprintf("avif: SetIOMemory failed: %s\n", avifResultToString(result));
+        goto cleanup;
+    }
+
+    if (avifDecoderParse(decoder) != AVIF_RESULT_OK)
+    {
+        dprintf("avif: Parse failed: %s (%s)\n", avifResultToString(result), decoder->diag.error);
+        goto cleanup;
+    }
+
+    // decodes the first frame only
+    if (avifDecoderNextImage(decoder) != AVIF_RESULT_OK)
+    {
+        dprintf("avif: NextImage failed: %s (%s)\n", avifResultToString(result), decoder->diag.error);
+        goto cleanup;
+    }
+
+    avifImage *image = decoder->image;
+
+    avifRGBImage rgb;
+    avifRGBImageSetDefaults(&rgb, image);
+    rgb.format = AVIF_RGB_FORMAT_RGBA;
+    rgb.depth  = 8;
+
+    const uint32_t channels = 4; /* RGBA */
+    rgb.rowBytes            = (uint32_t)rgb.width * channels * (rgb.depth > 8 ? 2 : 1);
+
+    size_t out_size = (size_t)rgb.rowBytes * rgb.height;
+
+    void *pixels = block_ensure_commit(out_pixels, out_size);
+    if (!pixels)
+    {
+        dprintf("avif: block_ensure_commit failed for %zu bytes\n", out_size);
+        goto cleanup;
+    }
+    rgb.pixels = (uint8_t *)pixels;
+
+    if (avifImageYUVToRGB(image, &rgb) != AVIF_RESULT_OK)
+    {
+        dprintf("avif: YUVToRGB failed: %s\n", avifResultToString(result));
+        goto cleanup;
+    }
+
+    *out_w      = (UINT)image->width;
+    *out_h      = (UINT)image->height;
+    *out_format = PIXEL_FORMAT_RGBA8;
+
+    result = true;
+
+cleanup:
+    avifDecoderDestroy(decoder);
+    return result;
+}
+
+//
 // DECODE
 //
 
@@ -639,6 +716,10 @@ static bool decode_image(struct mem_block *out_pixels, tjhandle tj_handle, const
         else if (_wcsicmp(ext, L".png") == 0)
         {
             result = decode_png_spng(&file, out_pixels, w, h, out_format);
+        }
+        else if (_wcsicmp(ext, L".avif") == 0)
+        {
+            result = decode_avif(&file, out_pixels, w, h, out_format);
         }
 
         // try again / defualt with wic
@@ -732,13 +813,14 @@ static DWORD WINAPI background_prefetch_thread(LPVOID arg)
         image_full_path(target, full_path, MAX_PATH);
 
         if (1) dprintf("thread %u decoding %u, '%ls'\n", thread_id, target, full_path);
-
         bool res = decode_image(&g_cache.entries[i].block,
                                 tj_handle,
                                 full_path,
                                 &g_cache.entries[i].w,
                                 &g_cache.entries[i].h,
                                 &g_cache.entries[i].format);
+        if (!res) dprintf("ERROR '%ls'\n", full_path);
+
         if (res)
         {
             // TODO : do we need to lock here?
