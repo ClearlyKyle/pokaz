@@ -56,7 +56,7 @@
 static const wchar_t *SUPPORTED_EXTENSIONS[] = {
     L".jpg", L".jpeg", L".png", L".bmp", L".gif",
     L".tiff", L".tif", L".ico", L".webp", L".wdp",
-    L".hdp", L".jxr", L".avif"};
+    L".hdp", L".jxr", L".avif", L".dds"};
 
 //
 // DEBUG
@@ -288,11 +288,49 @@ void file_list_remove_at(uint32_t idx)
 #define GL_BGRA (0x80E1)
 #endif
 
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+#define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT (0x83F1)
+#define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT (0x83F2)
+#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT (0x83F3)
+#endif
+#ifndef GL_COMPRESSED_RED_RGTC1
+#define GL_COMPRESSED_RED_RGTC1 (0x8DBB)
+#define GL_COMPRESSED_RG_RGTC2  (0x8DBD)
+#endif
+#ifndef GL_COMPRESSED_RGBA_BPTC_UNORM
+#define GL_COMPRESSED_RGBA_BPTC_UNORM (0x8E8C)
+#endif
+
+// extra api we need to load ourselves
+typedef void(APIENTRY *PFNGLCOMPRESSEDTEXIMAGE2DPROC)(GLenum target, GLint level, GLenum internalformat,
+                                                      GLsizei width, GLsizei height, GLint border,
+                                                      GLsizei imageSize, const void *data);
+
+static PFNGLCOMPRESSEDTEXIMAGE2DPROC glCompressedTexImage2D = NULL;
+
+static bool opengl_load_extensions(void)
+{
+    glCompressedTexImage2D = (PFNGLCOMPRESSEDTEXIMAGE2DPROC)wglGetProcAddress("glCompressedTexImage2D");
+    if (!glCompressedTexImage2D)
+    {
+        dprintf("opengl_load_extensions: glCompressedTexImage2D not available\n");
+        return false;
+    }
+
+    return true;
+}
+
 enum pixel_format
 {
     PIXEL_FORMAT_RGB8,  // 3 bytes/px: R,G,B
     PIXEL_FORMAT_RGBA8, // 4 bytes/px: R,G,B,A
     PIXEL_FORMAT_BGRA8, // 4 bytes/px: B,G,R,A
+    PIXEL_FORMAT_BC1,   // DXT1
+    PIXEL_FORMAT_BC2,   // DXT3
+    PIXEL_FORMAT_BC3,   // DXT5
+    PIXEL_FORMAT_BC4,   // ATI1 / single channel
+    PIXEL_FORMAT_BC5,   // ATI2 / two channel (normal maps)
+    PIXEL_FORMAT_BC7,   // high quality RGBA
 };
 
 struct gl_context
@@ -328,6 +366,8 @@ static inline bool opengl_init(HWND hwnd)
 
     if (!wglMakeCurrent(g_gl.hdc, g_gl.hglrc)) return false;
 
+    opengl_load_extensions();
+
     // glClearColor(0.0f, 0.3686f, 0.7216f, 1.0f); // pantone 300 C
     glClearColor(0.12f, 0.12f, 0.12f, 1.0f);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -359,44 +399,51 @@ static void opengl_cleanup(HWND hwnd)
 
 static GLuint opengl_texture_upload(BYTE *buf, UINT w, UINT h, enum pixel_format format)
 {
-    GLenum gl_format       = GL_RGBA;
-    GLenum internal_format = GL_RGBA8;
-    GLint  alignment       = 4;
-
-    switch (format)
-    {
-        case PIXEL_FORMAT_RGB8:
-            gl_format       = GL_RGB;
-            internal_format = GL_RGB8;
-            alignment       = 1;
-            break;
-        case PIXEL_FORMAT_RGBA8:
-            gl_format       = GL_RGBA;
-            internal_format = GL_RGBA8;
-            alignment       = 4;
-            break;
-        case PIXEL_FORMAT_BGRA8:
-            gl_format       = GL_BGRA;
-            internal_format = GL_RGBA8;
-            alignment       = 4;
-            break;
-    }
-
-    glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
-
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
-    glTexImage2D(GL_TEXTURE_2D, 0, internal_format, w, h, 0, gl_format, GL_UNSIGNED_BYTE, buf);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    GLenum gl_internal = 0;
+    GLenum gl_format   = 0;
+    UINT   block_bytes = 0;
+    GLint  alignment   = 4;
 
+    // clang-format off
+    switch (format)
+    {
+        // dds
+        case PIXEL_FORMAT_BC1: gl_internal = GL_COMPRESSED_RGBA_S3TC_DXT1_EXT; block_bytes = 8;  break;
+        case PIXEL_FORMAT_BC2: gl_internal = GL_COMPRESSED_RGBA_S3TC_DXT3_EXT; block_bytes = 16; break;
+        case PIXEL_FORMAT_BC3: gl_internal = GL_COMPRESSED_RGBA_S3TC_DXT5_EXT; block_bytes = 16; break;
+        case PIXEL_FORMAT_BC4: gl_internal = GL_COMPRESSED_RED_RGTC1;          block_bytes = 8;  break;
+        case PIXEL_FORMAT_BC5: gl_internal = GL_COMPRESSED_RG_RGTC2;           block_bytes = 16; break;
+        case PIXEL_FORMAT_BC7: gl_internal = GL_COMPRESSED_RGBA_BPTC_UNORM;    block_bytes = 16; break;
+
+        // other
+        case PIXEL_FORMAT_RGB8:  gl_internal = GL_RGB8;  gl_format = GL_RGB;  alignment = 1; break;
+        case PIXEL_FORMAT_RGBA8: gl_internal = GL_RGBA8; gl_format = GL_RGBA; alignment = 4; break;
+        case PIXEL_FORMAT_BGRA8: gl_internal = GL_RGBA8; gl_format = GL_BGRA; alignment = 4; break;
+
+        default: break;
+    }
+    // clang-format on
+
+    if (block_bytes > 0)
+    {
+        GLsizei data_size = (GLsizei)(((w + 3) / 4) * ((h + 3) / 4) * block_bytes);
+        glCompressedTexImage2D(GL_TEXTURE_2D, 0, gl_internal, w, h, 0, data_size, buf);
+    }
+    else if (gl_format != 0)
+    {
+        glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+        glTexImage2D(GL_TEXTURE_2D, 0, gl_internal, w, h, 0, gl_format, GL_UNSIGNED_BYTE, buf);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, 0);
     return tex;
 }
-
 //
 // MAPPING FILES
 //
@@ -434,6 +481,161 @@ static void file_map_unmap(struct file_map *map)
     if (map->data) UnmapViewOfFile(map->data);
     if (map->mapping_handle) CloseHandle(map->mapping_handle);
     if (map->file_handle != INVALID_HANDLE_VALUE) CloseHandle(map->file_handle);
+}
+
+//
+// DDS
+//
+
+#define DDS_MAGIC (0x20534444u) // "DDS "
+
+#define FOURCC(a, b, c, d) ((UINT32)(BYTE)(a) | ((UINT32)(BYTE)(b) << 8) | \
+                            ((UINT32)(BYTE)(c) << 16) | ((UINT32)(BYTE)(d) << 24))
+
+#define FOURCC_DXT1 FOURCC('D', 'X', 'T', '1')
+#define FOURCC_DXT3 FOURCC('D', 'X', 'T', '3')
+#define FOURCC_DXT5 FOURCC('D', 'X', 'T', '5')
+#define FOURCC_ATI1 FOURCC('A', 'T', 'I', '1')
+#define FOURCC_ATI2 FOURCC('A', 'T', 'I', '2')
+#define FOURCC_BC4U FOURCC('B', 'C', '4', 'U')
+#define FOURCC_BC5U FOURCC('B', 'C', '5', 'U')
+#define FOURCC_DX10 FOURCC('D', 'X', '1', '0')
+
+// #pragma pack(push, 1)
+struct dds_pixelformat
+{
+    DWORD dwSize;
+    DWORD dwFlags;
+    DWORD dwFourCC;
+    DWORD dwRGBBitCount;
+    DWORD dwRBitMask;
+    DWORD dwGBitMask;
+    DWORD dwBBitMask;
+    DWORD dwABitMask;
+};
+
+struct dds_header
+{
+    DWORD                  dwSize;
+    DWORD                  dwFlags;
+    DWORD                  dwHeight;
+    DWORD                  dwWidth;
+    DWORD                  dwPitchOrLinearSize;
+    DWORD                  dwDepth;
+    DWORD                  dwMipMapCount;
+    DWORD                  dwReserved1[11];
+    struct dds_pixelformat ddspf;
+    DWORD                  dwCaps;
+    DWORD                  dwCaps2;
+    DWORD                  dwCaps3;
+    DWORD                  dwCaps4;
+    DWORD                  dwReserved2;
+};
+
+enum d3d10_resource_dimension
+{
+    D3D10_RESOURCE_DIMENSION_UNKNOWN   = 0,
+    D3D10_RESOURCE_DIMENSION_BUFFER    = 1,
+    D3D10_RESOURCE_DIMENSION_TEXTURE1D = 2,
+    D3D10_RESOURCE_DIMENSION_TEXTURE2D = 3,
+    D3D10_RESOURCE_DIMENSION_TEXTURE3D = 4
+};
+
+struct dds_header_dxt10
+{
+    DXGI_FORMAT                   dxgiFormat;
+    enum d3d10_resource_dimension resourceDimension;
+    UINT                          miscFlag;
+    UINT                          arraySize;
+    UINT                          miscFlags2;
+};
+
+static bool dds_block_bytes(enum pixel_format fmt, UINT *out_bytes)
+{
+    switch (fmt)
+    {
+        case PIXEL_FORMAT_BC1:
+        case PIXEL_FORMAT_BC4: *out_bytes = 8; return true;
+        case PIXEL_FORMAT_BC2:
+        case PIXEL_FORMAT_BC3:
+        case PIXEL_FORMAT_BC5:
+        case PIXEL_FORMAT_BC7: *out_bytes = 16; return true;
+        default: return false;
+    }
+}
+
+static bool decode_dds(struct file_map *map, struct mem_block *out_pixels, UINT *out_w, UINT *out_h, enum pixel_format *out_format)
+{
+    if (!map || !out_pixels || !out_w || !out_h || !out_format) return false;
+    if (map->size < 4 + sizeof(struct dds_header)) return false;
+
+    BYTE *base = (BYTE *)map->data;
+    if (*(UINT32 *)base != DDS_MAGIC) return false;
+
+    struct dds_header *hdr    = (struct dds_header *)(base + 4);
+    size_t             offset = 4 + sizeof(struct dds_header);
+    enum pixel_format  format;
+
+    if (hdr->ddspf.dwFourCC == FOURCC_DX10)
+    {
+        if (map->size < offset + sizeof(struct dds_header_dxt10)) return false;
+        struct dds_header_dxt10 *dx10 = (struct dds_header_dxt10 *)(base + offset);
+        offset += sizeof(struct dds_header_dxt10);
+
+        switch (dx10->dxgiFormat)
+        {
+            case 71:
+            case 72: format = PIXEL_FORMAT_BC1; break; // BC1_UNORM[_SRGB]
+            case 74:
+            case 75: format = PIXEL_FORMAT_BC2; break;
+            case 77:
+            case 78: format = PIXEL_FORMAT_BC3; break;
+            case 80:
+            case 81: format = PIXEL_FORMAT_BC4; break;
+            case 83:
+            case 84: format = PIXEL_FORMAT_BC5; break;
+            case 98:
+            case 99: format = PIXEL_FORMAT_BC7; break;
+            default:
+                dprintf("decode_dds: unsupported dxgiFormat %u\n", dx10->dxgiFormat);
+                return false;
+        }
+    }
+    else
+    {
+        switch (hdr->ddspf.dwFourCC)
+        {
+            case FOURCC_DXT1: format = PIXEL_FORMAT_BC1; break;
+            case FOURCC_DXT3: format = PIXEL_FORMAT_BC2; break;
+            case FOURCC_DXT5: format = PIXEL_FORMAT_BC3; break;
+            case FOURCC_ATI1:
+            case FOURCC_BC4U: format = PIXEL_FORMAT_BC4; break;
+            case FOURCC_ATI2:
+            case FOURCC_BC5U: format = PIXEL_FORMAT_BC5; break;
+            default:
+                dprintf("decode_dds: unsupported fourCC 0x%08x\n", hdr->ddspf.dwFourCC);
+                return false;
+        }
+    }
+
+    UINT w = hdr->dwWidth, h = hdr->dwHeight, block_bytes;
+    if (!dds_block_bytes(format, &block_bytes)) return false;
+
+    size_t data_size = (size_t)((w + 3) / 4) * ((h + 3) / 4) * block_bytes;
+    if (map->size < offset + data_size)
+    {
+        dprintf("decode_dds: truncated file\n");
+        return false;
+    }
+
+    void *dst = block_ensure_commit(out_pixels, data_size);
+    if (!dst) return false;
+    memcpy(dst, base + offset, data_size);
+
+    *out_w      = w;
+    *out_h      = h;
+    *out_format = format;
+    return true;
 }
 
 //
@@ -722,6 +924,10 @@ static bool decode_image(struct mem_block *out_pixels, tjhandle tj_handle, const
         else if (_wcsicmp(ext, L".avif") == 0)
         {
             result = decode_avif(&file, out_pixels, w, h, out_format);
+        }
+        else if (_wcsicmp(ext, L".dds") == 0)
+        {
+            result = decode_dds(&file, out_pixels, w, h, out_format);
         }
 
         // try again / defualt with wic

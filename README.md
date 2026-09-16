@@ -5,7 +5,7 @@ A high-performance, lightweight image viewer for Windows written in native C, ha
 
 ## Supported Formats
 - **Standard:** PNG, JPEG, BMP, GIF, TIFF, ICO
-- **Modern & Extended:** WebP, JXR, HDP, WDP, AVIF
+- **Modern & Extended:** WebP, JXR, HDP, WDP, AVIF, DDS
 
 
 ## Usage
@@ -40,4 +40,16 @@ A high-performance, lightweight image viewer for Windows written in native C, ha
 * **[libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo)** – JPEG decoding
 * **[libspng](https://github.com/randy408/libspng)** – PNG decoding
 * **[libavif](https://github.com/AOMediaCodec/libavif)** – AVIF image container parsing (requires `dav1d`)
+
+
+### 1. Build `libavif`
+```bat
+cd ext\dav1d
+meson setup build --default-library=static --buildtype=release -Db_vscrt=mt
+ninja -C build
+```
+```bat
+cmake -S . -B build -G Ninja -DBUILD_SHARED_LIBS=OFF -DAVIF_CODEC_DAV1D=LOCAL -DAVIF_LIBYUV=OFF -DAVIF_BUILD_APPS=OFF -DCMAKE_C_FLAGS_RELEASE="/MT /O2 /Ob2 /DNDEBUG" -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
 
