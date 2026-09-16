@@ -233,13 +233,15 @@ struct main_image
     float pan_start_x, pan_start_y;
     float pan_x, pan_y;
     bool  dragging;
+
+    bool fit_to_window;
 };
 
 static int g_win_w = WINDOW_START_W;
 static int g_win_h = WINDOW_START_H;
 
 static struct file_list  g_files      = {0};
-static struct main_image g_main_image = {0};
+static struct main_image g_main_image = {.fit_to_window = true};
 
 static void     image_full_path(uint32_t index, wchar_t *out, size_t out_cap);
 static uint32_t image_map_index(int offset);
@@ -1049,6 +1051,12 @@ static inline void image_reset_view(void)
     g_main_image.rotation = 0;
 }
 
+static inline void image_toggle_fit_mode(void)
+{
+    g_main_image.fit_to_window = !g_main_image.fit_to_window;
+    g_main_image.zoom          = 0.0f; // start clean in the new mode
+}
+
 static uint32_t image_map_index(int offset)
 {
     if (g_files.file_count == 0) return 0;
@@ -1168,6 +1176,12 @@ static void image_show_current(void)
 
 static float image_compute_scale(void)
 {
+    if (!g_main_image.fit_to_window)
+    {
+        // stil allow zoom but image keeps its own scale/size
+        return powf(1.15f, g_main_image.zoom);
+    }
+
     int is_sideways = (g_main_image.rotation % 180 != 0);
     int fit_w       = is_sideways ? g_main_image.h : g_main_image.w;
     int fit_h       = is_sideways ? g_main_image.w : g_main_image.h;
@@ -1626,6 +1640,12 @@ static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
                     InvalidateRect(hwnd, NULL, FALSE);
                     break;
                 }
+                case 'F':
+                {
+                    image_toggle_fit_mode();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                }
                 case '0':
                 {
                     image_reset_view();
@@ -1938,5 +1958,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     block_free(&g_files.block);
 
+    dprintf("pokaz pokaz\n");
     return (int)msg.wParam;
 }

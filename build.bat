@@ -13,7 +13,7 @@ set COMMON_LFLAGS=/link /ENTRY:wWinMainCRTStartup /LIBPATH:deps
 if /i "%MODE%"=="release" (
     set CFLAGS=%COMMON_CFLAGS% /O2 /Gy /Gw /GL /DNDEBUG
     set LFLAGS=%COMMON_LFLAGS% /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF
-    set FILENAME=pokaz-v1.0.0-win64-release.exe
+    set FILENAME=pokaz-win64-release.exe
 ) else (
     set CFLAGS=%COMMON_CFLAGS% /Z7 /Od /DDEBUG
     set LFLAGS=%COMMON_LFLAGS% /SUBSYSTEM:CONSOLE
